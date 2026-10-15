@@ -18,6 +18,9 @@
 - [核心 API](#核心-api)
 - [路由与 handler](#路由与-handler)
 - [统一响应格式](#统一响应格式)
+- [原始响应（文件 / 页面下载）](#原始响应文件--页面下载)
+- [视图渲染 ctx.sendview](#视图渲染-ctxsendview)
+- [ctx 响应控制（status / header / cookie）](#ctx-响应控制status--header--cookie)
 - [HTTP 状态码约定](#http-状态码约定)
 - [内置认证能力](#内置认证能力)
 - [登录态与令牌](#登录态与令牌)
@@ -63,6 +66,7 @@ const server = createAuthServer()
 | `createAuthServer()` | 工厂函数，返回可链式构建器 | `AuthServer` |
 | `.userStore(filePath)` | 用户信息 + 设置的**存储文件**（文件存储，非数据库；不存在时自动创建） | `AuthServer` |
 | `.static(dirPath)` | 静态资源托管目录（默认不鉴权） | `AuthServer` |
+| `.views(dirPath)` | 视图模板目录（`sendView` 从此读模板）；不配则默认复用 `static` | `AuthServer` |
 | `.title(text)` | 内置页面（登录/注册/管理台）的标题，默认 `xie-auth` | `AuthServer` |
 | `.upload(dirPath, opts?)` | 上传落盘目录（**无默认值**）+ 大小/有效期等配置 | `AuthServer` |
 | `.use(path, method?, handler)` | 注册**公开**接口（不拦截） | `AuthServer` |
@@ -96,7 +100,13 @@ ctx = {
   method,   // 实际命中方法
   path,     // 路由定义路径
   user,     // 当前登录用户；未登录为 null（受保护/管理员路由必有）
+  cookies,  // 只读：解析后的请求 Cookie 对象
   req, res, // 兜底：需要操作原始请求/响应时
+
+  // 响应控制（写一次对所有出口生效，见“ctx 响应控制”）
+  status, set, append, get, cookie, clearCookie,
+  // 原始响应构建（绕过 JSON 封装，见“原始响应”/“视图渲染”）
+  sendFile, sendHtml, sendBuffer, sendText, sendView,
 }
 ```
 
@@ -134,6 +144,82 @@ ctx = {
 | handler 抛出异常 | `500` | `{ success: false, message: <error.message>, data: null }` |
 | 鉴权失败（`useAuth`/`useAdmin`） | `401` | `{ success: false, message: 'Unauthorized', data: null }` |
 | IP 被拒绝 | `403` | `{ success: false, message: 'Forbidden', data: null }` |
+
+> 例外：handler 返回 `ctx.sendFile/sendHtml/sendBuffer/sendText/sendView(...)` 时**绕过 JSON 封装**，直接产出原始响应（见下节）。
+
+---
+
+## 原始响应（文件 / 页面下载）
+
+当需要返回文件下载、HTML 页面等非 JSON 内容时，用 `ctx` 上的响应构建方法 `return` 一个响应描述对象，库会**跳过统一封装**直接发送：
+
+| 方法 | 用途 | Content-Type |
+|------|------|--------------|
+| `ctx.sendFile(filePath, opts?)` | 返回磁盘文件（**流式**发送，大文件不占内存） | 按扩展名推断，可用 `opts.mimeType` 覆盖 |
+| `ctx.sendHtml(html, opts?)` | 返回一段 HTML 页面 | `text/html` |
+| `ctx.sendBuffer(buffer, opts?)` | 返回内存内容（如导出的报表 / CSV） | `opts.contentType`，默认 `application/octet-stream` |
+| `ctx.sendText(text, opts?)` | 返回纯文本 | `text/plain` |
+| `ctx.sendView(viewPath, model?, opts?)` | 渲染**视图目录**下的模板（插值后输出） | `text/html` |
+
+```js
+.use('/export', (ctx) => ctx.sendFile('/data/report.pdf'))                       // 默认作为附件下载
+.use('/preview', (ctx) => ctx.sendFile('/data/a.png', { download: false }))      // 浏览器内联预览
+.use('/export-as', (ctx) => ctx.sendFile('/data/tmp.dat', { filename: '订单.csv' })) // 自定义下载名
+.use('/report', (ctx) => ctx.sendHtml('<h1>报表</h1>'))
+.use('/dump', (ctx) => ctx.sendBuffer(Buffer.from('a,b\n1,2'), { contentType: 'text/csv', filename: 'd.csv' }))
+```
+
+- **下载 vs 内联**：`sendFile` 默认 `Content-Disposition: attachment`，传 `download: false` 改为 `inline`；文件名兼容非 ASCII（RFC 5987 `filename*`）。
+- **缺文件**：`sendFile` 指向的路径不存在时自动返回 **404** `{ success:false, ... }`，handler 无需自行判存在。
+- 所有方法均支持 `opts.status` 与 `opts.headers` 覆盖状态码 / 追加响应头（更多见下节“ctx 响应控制”，一次性设好无需重复传）。
+
+---
+
+## 视图渲染 `ctx.sendView()`
+
+从**视图目录**（`.views(dir)` 配置，不配则复用 `static`）读取模板，用 `model` 做插值后作为 `text/html` 返回：
+
+```js
+// views/user.html：  <h1>{{user.name}}</h1>  <div>{{{user.bio}}}</div>
+.use('/u/:id', (ctx) => ctx.sendView('/user.html', { user: { name: 'Tom', bio: '<b>Hi</b>' } }))
+```
+
+插值语法（零依赖的极简 Mustache 子集）：
+
+| 写法 | 含义 |
+|------|------|
+| `{{ expr }}` | 取值并 **HTML 转义**后插入（默认，防 XSS） |
+| `{{{ expr }}}` | 取值后 **原样**插入（渲染富文本 / HTML 片段） |
+| `{{ user.name }}` / `{{ list.0.title }}` | 支持点路径与数组下标 |
+
+- 缺失变量替换为**空串**；模板文件不存在自动 **404**。
+- 仅做值替换，**不含条件 / 循环 / 逻辑**；需要时在 handler 里先算好再塞进 `model`。
+- `viewPath` 相对视图目录解析并**防目录穿越**（`..` 被拒绝）。
+
+---
+
+## ctx 响应控制（status / header / cookie）
+
+`ctx` 提供一组响应控制方法，写一次即对**所有出口生效**（JSON 自动封装 / `send*` / `sendView`），无需在每个 `send` 的 `opts` 里重复定义 header：
+
+```js
+.use('/create', (ctx) => {
+  ctx.status(201)                                   // 状态码
+  ctx.set('X-Trace-Id', 'abc')                      // 单个响应头
+  ctx.set({ 'A': '1', 'B': '2' })                   // 批量
+  ctx.append('Link', '</a.css>; rel=preload')       // 追加（同名多值）
+  ctx.cookie('theme', 'dark', { maxAge: 3600, httpOnly: true }) // 写 Cookie
+  ctx.clearCookie('theme')                          // 清 Cookie
+  return { ok: true }                               // 以上自动带入 JSON 响应
+})
+const who = ctx.cookies.username                    // 读请求 Cookie（只读对象）
+const ua  = ctx.get('user-agent')                   // 读请求头
+```
+
+**优先级（从低到高）**：框架默认 → `ctx.status/set/cookie` 累积值 → 单次 `send*(..., opts)` 里的 `opts.status / opts.headers`。
+
+- Cookie 用**追加**方式写入 `Set-Cookie`，多个 Cookie 共存；`clearCookie` 等价 `Max-Age=0`。值经 URL 编码。
+- `opts` 里的 `status/headers` 仅用于临时覆盖；常规场景用 `ctx.*` 一次设好即可。
 
 ---
 
@@ -270,6 +356,7 @@ HMAC 自签 token 无状态，签发后到期前天然有效。为支持"改密�
 |------|------|--------|
 | 用户/设置存储文件 | `.userStore()` | `~/.xie-auth/users.json`（用户主目录下） |
 | 静态资源目录 | `.static()` | 入口文件同级的 `public`（`node app.js` → `./app.js旁的/public`） |
+| 视图模板目录 | `.views()` | 未配置时 `sendView` 回退到 `static` 目录 |
 | 上传落盘目录 | `.upload()` | **无默认值**（未配置则不启用上传） |
 | 服务端口 | `.serve()` | `3333` |
 | 上传大小上限 | `.upload()` | `10MB` |
@@ -297,7 +384,7 @@ xie-auth/
 │   ├── index.ts            # 入口：导出 createAuthServer / AuthServer / 类型
 │   ├── AuthServer.ts       # 链式 Builder + 请求分发流水线 + 内置路由
 │   ├── types.ts / crypto.ts / store.ts / router.ts / util.ts / ipFilter.ts
-│   ├── net/                # multipart / request / response / upload
+│   ├── net/                # multipart / request / response / upload / cookie / template
 │   └── auth/               # session / pages / guardScript
 ├── test/                   # 针对构建产物（dist/）的端到端功能测试
 │   └── server.test.mjs

@@ -1,6 +1,6 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
-import { existsSync, statSync, createReadStream } from 'node:fs'
-import { join, resolve, normalize, extname, dirname } from 'node:path'
+import { existsSync, statSync, createReadStream, readFileSync } from 'node:fs'
+import { join, resolve, normalize, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import type {
   Access,
@@ -10,12 +10,21 @@ import type {
   Route,
   UserRole,
   UserStatus,
+  BufferResponse,
+  FileResponse,
+  HtmlResponse,
+  TextResponse,
+  ViewResponse,
 } from './types.js'
+import { RAW_RESPONSE } from './types.js'
 import { Store, toPublicUser } from './store.js'
 import { hashPassword, verifyPassword } from './crypto.js'
 import { normalizeMethods, compilePath, findRoute, globToRegExp } from './router.js'
 import { readBody, parseQuery, parseBody } from './net/request.js'
-import { sendJson, sendHtml, sendRedirect, wrapResult } from './net/response.js'
+import { sendJson, sendHtml, sendRedirect, wrapResult, isRawResponse, sendRawResponse, guessContentType } from './net/response.js'
+import type { ResponseDefaults } from './net/response.js'
+import { parseCookies, serializeCookie } from './net/cookie.js'
+import { renderTemplate } from './net/template.js'
 import { UploadManager } from './net/upload.js'
 import { getClientIp, isIpAllowed } from './ipFilter.js'
 import {
@@ -54,6 +63,7 @@ interface GuardCompiled extends GuardRule {
 export class AuthServer {
   private storePath = DEFAULT_STORE
   private staticDir = DEFAULT_STATIC
+  private viewsDir: string | null = null
   private pageTitle = 'xie-auth'
   private uploadOpts: { dir: string; opts?: UploadOptions } | null = null
   private routes: Route[] = []
@@ -72,6 +82,12 @@ export class AuthServer {
 
   static(dirPath: string): this {
     this.staticDir = dirPath
+    return this
+  }
+
+  /** 视图模板目录（sendView 从此读模板）；不配则默认复用 static 目录 */
+  views(dirPath: string): this {
+    this.viewsDir = dirPath
     return this
   }
 
@@ -141,6 +157,7 @@ export class AuthServer {
     console.log('  title     :', this.pageTitle)
     console.log('  userStore :', resolve(this.storePath))
     console.log('  static    :', resolve(this.staticDir))
+    console.log('  views     :', this.viewsDir ? resolve(this.viewsDir) : '(未配置，sendView 复用 static)')
     console.log('  upload    :', this.uploadOpts ? resolve(this.uploadOpts.dir) : '(未配置)')
     console.log('  port      :', port)
     return this
@@ -236,6 +253,8 @@ export class AuthServer {
     const limit = this.uploadConfig ? this.uploadConfig.maxSizeBytes * this.uploadConfig.maxFiles : DEFAULT_JSON_LIMIT
     const raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req, limit)
     const { body, files } = parseBody(req, raw, this.uploadManager)
+    // ctx 层累积的响应默认值：无论 return 数据还是 send*，出口统一应用
+    const defaults: ResponseDefaults = { headers: {}, cookies: [], append: {} }
     const ctx: Ctx = {
       params,
       query: parseQuery(url),
@@ -246,15 +265,74 @@ export class AuthServer {
       user,
       req,
       res,
+      get cookies() {
+        return parseCookies(req)
+      },
+      status: (code) => {
+        defaults.status = code
+      },
+      set: (name, value) => {
+        if (typeof name === 'string') {
+          if (value !== undefined) defaults.headers![name] = value
+        } else {
+          Object.assign(defaults.headers!, name)
+        }
+      },
+      append: (name, value) => {
+        ;(defaults.append![name] ??= []).push(value)
+      },
+      get: (name) => {
+        const v = req.headers[name.toLowerCase()]
+        return Array.isArray(v) ? v[0] : v
+      },
+      cookie: (name, value, opts) => {
+        defaults.cookies!.push(serializeCookie(name, value, opts))
+      },
+      clearCookie: (name, opts) => {
+        defaults.cookies!.push(serializeCookie(name, '', { ...opts, maxAge: 0 }))
+      },
+      sendFile: (filePath, opts) =>
+        ({ [RAW_RESPONSE]: true, kind: 'file', filePath, ...opts } as unknown as FileResponse),
+      sendHtml: (html, opts) => ({ [RAW_RESPONSE]: true, kind: 'html', html, ...opts } as unknown as HtmlResponse),
+      sendBuffer: (buffer, opts) =>
+        ({ [RAW_RESPONSE]: true, kind: 'buffer', buffer, ...opts } as unknown as BufferResponse),
+      sendText: (text, opts) => ({ [RAW_RESPONSE]: true, kind: 'text', text, ...opts } as unknown as TextResponse),
+      sendView: (viewPath, model, opts) =>
+        ({ [RAW_RESPONSE]: true, kind: 'view', viewPath, model: model ?? {}, ...opts } as unknown as ViewResponse),
     }
     try {
       const returned = await route.handler(ctx)
       if (res.writableEnded) return
-      sendJson(res, 200, wrapResult(returned))
+      if (isRawResponse(returned)) {
+        if (returned.kind === 'view') {
+          const rendered = this.renderView(returned.viewPath)
+          if (!rendered.ok) {
+            sendJson(res, 404, { success: false, message: rendered.message, data: null }, defaults)
+            return
+          }
+          const html = renderTemplate(rendered.html, returned.model)
+          const desc = { [RAW_RESPONSE]: true, kind: 'html', html, status: returned.status, headers: returned.headers } as unknown as HtmlResponse
+          sendRawResponse(res, desc, defaults)
+          return
+        }
+        sendRawResponse(res, returned, defaults)
+        return
+      }
+      sendJson(res, defaults.status ?? 200, wrapResult(returned), defaults)
     } catch (err) {
       if (res.writableEnded) return
-      sendJson(res, 500, { success: false, message: (err as Error).message, data: null })
+      sendJson(res, 500, { success: false, message: (err as Error).message, data: null }, defaults)
     }
+  }
+
+  /** 定位并读取视图模板（相对视图目录，防目录穿越） */
+  private renderView(viewPath: string): { ok: true; html: string } | { ok: false; message: string } {
+    const root = resolve(this.viewsDir ?? this.staticDir)
+    const rel = normalize(decodeURIComponent(viewPath.split('?')[0])).replace(/^([/\\])+/, '')
+    const full = join(root, rel)
+    if (!full.startsWith(root)) return { ok: false, message: '非法模板路径' }
+    if (!existsSync(full) || !statSync(full).isFile()) return { ok: false, message: '模板不存在' }
+    return { ok: true, html: readFileSync(full, 'utf-8') }
   }
 
   // ---- /auth 静态页面与脚本 ----
@@ -304,7 +382,7 @@ export class AuthServer {
       if (!existsSync(target)) return false
     }
     res.writeHead(200, {
-      'Content-Type': contentType(target),
+      'Content-Type': guessContentType(target),
       'Content-Length': statSync(target).size,
     })
     if (method === 'HEAD') {
@@ -415,21 +493,4 @@ export class AuthServer {
       return store.updateSettings(patch)
     })
   }
-}
-
-const MIME: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.svg': 'image/svg+xml',
-  '.txt': 'text/plain; charset=utf-8',
-}
-
-function contentType(file: string): string {
-  return MIME[extname(file).toLowerCase()] ?? 'application/octet-stream'
 }

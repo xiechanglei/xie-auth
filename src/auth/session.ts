@@ -3,22 +3,11 @@ import { signToken, verifyToken } from '../crypto.js'
 import type { Store } from '../store.js'
 import { toPublicUser } from '../store.js'
 import type { PublicUser } from '../types.js'
+import { parseCookies, serializeCookie } from '../net/cookie.js'
 
 export const AUTH_COOKIE = 'xie_auth'
 
-/** 解析 Cookie 头 */
-export function parseCookies(req: IncomingMessage): Record<string, string> {
-  const header = req.headers.cookie ?? ''
-  const out: Record<string, string> = {}
-  for (const pair of header.split(';')) {
-    const idx = pair.indexOf('=')
-    if (idx === -1) continue
-    const k = pair.slice(0, idx).trim()
-    const v = pair.slice(idx + 1).trim()
-    if (k) out[k] = decodeURIComponent(v)
-  }
-  return out
-}
+export { parseCookies }
 
 /** 为用户签发 token */
 export function issueToken(store: Store, userId: string): string {
@@ -55,18 +44,18 @@ export function resolveUser(store: Store, req: IncomingMessage): PublicUser | nu
   return toPublicUser(user)
 }
 
-/** 设置登录 Cookie */
+/** 设置登录 Cookie（追加式，避免与其他 Set-Cookie 相互覆盖） */
 export function setAuthCookie(res: ServerResponse, token: string, ttlSeconds: number): void {
   const secure = false // MVP：如需 HTTPS 可置为 true
-  res.setHeader(
+  res.appendHeader(
     'Set-Cookie',
-    `${AUTH_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${ttlSeconds}${secure ? '; Secure' : ''}`,
+    serializeCookie(AUTH_COOKIE, token, { path: '/', httpOnly: true, sameSite: 'lax', maxAge: ttlSeconds, secure }),
   )
 }
 
 /** 清除登录 Cookie */
 export function clearAuthCookie(res: ServerResponse): void {
-  res.setHeader('Set-Cookie', `${AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`)
+  res.appendHeader('Set-Cookie', serializeCookie(AUTH_COOKIE, '', { path: '/', httpOnly: true, sameSite: 'lax', maxAge: 0 }))
 }
 
 /** 校验回跳地址：仅允许站内相对路径，防开放重定向 */
