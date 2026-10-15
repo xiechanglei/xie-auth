@@ -37,8 +37,11 @@ export interface Payload {
   files: FilesField
 }
 
-/** 依据 Content-Type 解析请求体；multipart 时文件交由 uploadManager 落盘 */
-export function parseBody(req: IncomingMessage, raw: Buffer, uploadManager: UploadManager | null): Payload {
+/**
+ * 依据 Content-Type 解析请求体；multipart 时文件交由 uploadManager 落盘。
+ * 新创建的临时文件绝对路径会 push 进传入的 tempPaths（即使中途抛错也已收集，供调用方 finally 清理）。
+ */
+export function parseBody(req: IncomingMessage, raw: Buffer, uploadManager: UploadManager | null, tempPaths: string[]): Payload {
   const contentType = (req.headers['content-type'] ?? '').toString()
   const body: Record<string, unknown> = {}
   const files: FilesField = {}
@@ -75,8 +78,7 @@ export function parseBody(req: IncomingMessage, raw: Buffer, uploadManager: Uplo
       }
     }
     if (uploadManager) {
-      const uploaded = uploadManager.persist(parts)
-      for (const key of Object.keys(uploaded)) files[key] = uploaded[key]
+      Object.assign(files, uploadManager.persist(parts, tempPaths))
     }
     return { body, files }
   }

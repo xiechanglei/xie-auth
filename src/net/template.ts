@@ -1,13 +1,3 @@
-/** HTML 实体转义，防 XSS */
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-}
-
 /**
  * 按点路径从 model 取值：`user.name`、`list.0.title`。
  * 任一段为 undefined/null 则返回 undefined。
@@ -39,8 +29,7 @@ function stringify(value: unknown): string {
 
 /**
  * 极简 Mustache 模板渲染（零依赖）：
- * - `{{ expr }}`  HTML 转义后插入（默认）
- * - `{{{ expr }}}` 原样插入（渲染富文本 / HTML 片段时用）
+ * - `{{ expr }}` 与 `{{{ expr }}}` 均**原样插入**（不做任何转义），内容由使用者自行保证安全
  * - expr 支持点路径与数组下标，如 `user.name`、`list.0.title`
  * - 未取到的变量替换为空串
  *
@@ -48,9 +37,7 @@ function stringify(value: unknown): string {
  */
 export function renderTemplate(template: string, model: Record<string, unknown>): string {
   return template.replace(/\{\{\{([\s\S]+?)\}\}\}|\{\{([\s\S]+?)\}\}/g, (_whole, raw, escaped) => {
-    if (raw !== undefined) {
-      return stringify(resolvePath(model, String(raw).trim()))
-    }
-    return escapeHtml(stringify(resolvePath(model, String(escaped).trim())))
+    const expr = String(raw !== undefined ? raw : escaped).trim()
+    return stringify(resolvePath(model, expr))
   })
 }

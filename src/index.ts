@@ -28,6 +28,7 @@ export type {
   TextResponse,
   UploadOptions,
   UploadedFile,
+  UploadedFileMeta,
   UserRole,
   UserStatus,
   ViewResponse,

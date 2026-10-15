@@ -36,7 +36,7 @@ import {
 } from './auth/session.js'
 import { loginPage, registerPage, managerPage } from './auth/pages.js'
 import { guardScript } from './auth/guardScript.js'
-import { parseSize, parseDuration } from './util.js'
+import { parseSize } from './util.js'
 import type { ResolvedUploadConfig, UploadOptions } from './types.js'
 
 const DEFAULT_STORE = join(homedir(), '.xie-auth', 'users.json')
@@ -137,7 +137,8 @@ export class AuthServer {
     if (this.uploadOpts) {
       this.uploadConfig = this.resolveUpload(this.uploadOpts)
       this.uploadManager = new UploadManager(this.uploadConfig)
-      this.uploadManager.startSweeper()
+      // 启动时清空临时暂存区，回收上次崩溃 / 重启遗留的孤儿文件
+      this.uploadManager.purgeStale()
     } else {
       this.uploadConfig = null
       this.uploadManager = null
@@ -164,7 +165,6 @@ export class AuthServer {
   }
 
   stop(): void {
-    this.uploadManager?.stopSweeper()
     if (this.server) {
       this.server.close()
       this.server = null
@@ -173,12 +173,9 @@ export class AuthServer {
 
   private resolveUpload(cfg: { dir: string; opts?: UploadOptions }): ResolvedUploadConfig {
     const o = cfg.opts ?? {}
-    const dir = resolve(cfg.dir)
     return {
-      dir,
-      keptDir: join(dir, 'kept'),
+      dir: resolve(cfg.dir),
       maxSizeBytes: o.maxSize !== undefined ? parseSize(o.maxSize) : parseSize('10MB'),
-      ttlMs: o.ttl !== undefined ? parseDuration(o.ttl) : parseDuration('24h'),
       allowExtensions: o.allowExtensions ?? null,
       maxFiles: o.maxFiles ?? 10,
     }
@@ -252,55 +249,57 @@ export class AuthServer {
   ): Promise<void> {
     const limit = this.uploadConfig ? this.uploadConfig.maxSizeBytes * this.uploadConfig.maxFiles : DEFAULT_JSON_LIMIT
     const raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req, limit)
-    const { body, files } = parseBody(req, raw, this.uploadManager)
+    // 本次请求落盘的临时文件（transferTo 会移走；未被转存的在 finally 中清理）
+    const tempPaths: string[] = []
     // ctx 层累积的响应默认值：无论 return 数据还是 send*，出口统一应用
     const defaults: ResponseDefaults = { headers: {}, cookies: [], append: {} }
-    const ctx: Ctx = {
-      params,
-      query: parseQuery(url),
-      body,
-      files,
-      method,
-      path: route.rawPath,
-      user,
-      req,
-      res,
-      get cookies() {
-        return parseCookies(req)
-      },
-      status: (code) => {
-        defaults.status = code
-      },
-      set: (name, value) => {
-        if (typeof name === 'string') {
-          if (value !== undefined) defaults.headers![name] = value
-        } else {
-          Object.assign(defaults.headers!, name)
-        }
-      },
-      append: (name, value) => {
-        ;(defaults.append![name] ??= []).push(value)
-      },
-      get: (name) => {
-        const v = req.headers[name.toLowerCase()]
-        return Array.isArray(v) ? v[0] : v
-      },
-      cookie: (name, value, opts) => {
-        defaults.cookies!.push(serializeCookie(name, value, opts))
-      },
-      clearCookie: (name, opts) => {
-        defaults.cookies!.push(serializeCookie(name, '', { ...opts, maxAge: 0 }))
-      },
-      sendFile: (filePath, opts) =>
-        ({ [RAW_RESPONSE]: true, kind: 'file', filePath, ...opts } as unknown as FileResponse),
-      sendHtml: (html, opts) => ({ [RAW_RESPONSE]: true, kind: 'html', html, ...opts } as unknown as HtmlResponse),
-      sendBuffer: (buffer, opts) =>
-        ({ [RAW_RESPONSE]: true, kind: 'buffer', buffer, ...opts } as unknown as BufferResponse),
-      sendText: (text, opts) => ({ [RAW_RESPONSE]: true, kind: 'text', text, ...opts } as unknown as TextResponse),
-      sendView: (viewPath, model, opts) =>
-        ({ [RAW_RESPONSE]: true, kind: 'view', viewPath, model: model ?? {}, ...opts } as unknown as ViewResponse),
-    }
     try {
+      const { body, files } = parseBody(req, raw, this.uploadManager, tempPaths)
+      const ctx: Ctx = {
+        params,
+        query: parseQuery(url),
+        body,
+        files,
+        method,
+        path: route.rawPath,
+        user,
+        req,
+        res,
+        get cookies() {
+          return parseCookies(req)
+        },
+        status: (code) => {
+          defaults.status = code
+        },
+        set: (name, value) => {
+          if (typeof name === 'string') {
+            if (value !== undefined) defaults.headers![name] = value
+          } else {
+            Object.assign(defaults.headers!, name)
+          }
+        },
+        append: (name, value) => {
+          ;(defaults.append![name] ??= []).push(value)
+        },
+        get: (name) => {
+          const v = req.headers[name.toLowerCase()]
+          return Array.isArray(v) ? v[0] : v
+        },
+        cookie: (name, value, opts) => {
+          defaults.cookies!.push(serializeCookie(name, value, opts))
+        },
+        clearCookie: (name, opts) => {
+          defaults.cookies!.push(serializeCookie(name, '', { ...opts, maxAge: 0 }))
+        },
+        sendFile: (filePath, opts) =>
+          ({ [RAW_RESPONSE]: true, kind: 'file', filePath, ...opts } as unknown as FileResponse),
+        sendHtml: (html, opts) => ({ [RAW_RESPONSE]: true, kind: 'html', html, ...opts } as unknown as HtmlResponse),
+        sendBuffer: (buffer, opts) =>
+          ({ [RAW_RESPONSE]: true, kind: 'buffer', buffer, ...opts } as unknown as BufferResponse),
+        sendText: (text, opts) => ({ [RAW_RESPONSE]: true, kind: 'text', text, ...opts } as unknown as TextResponse),
+        sendView: (viewPath, model, opts) =>
+          ({ [RAW_RESPONSE]: true, kind: 'view', viewPath, model: model ?? {}, ...opts } as unknown as ViewResponse),
+      }
       const returned = await route.handler(ctx)
       if (res.writableEnded) return
       if (isRawResponse(returned)) {
@@ -322,6 +321,9 @@ export class AuthServer {
     } catch (err) {
       if (res.writableEnded) return
       sendJson(res, 500, { success: false, message: (err as Error).message, data: null }, defaults)
+    } finally {
+      // 无论成功 / 报错，都清掉本次未被 transferTo 转走的临时文件
+      UploadManager.cleanupTemp(tempPaths)
     }
   }
 

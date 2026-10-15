@@ -43,7 +43,7 @@ const server = createAuthServer()
   .userStore('./data/users.json')        // 可省略，默认 ~/.xie-auth/users.json
   .static('./public')                    // 可省略，默认入口文件同级的 public
   .title('我的系统')                   // 可省略，内置页面标题默认 xie-auth
-  .upload('./data/uploads')              // 上传落盘目录（无默认值，防多应用并行冲突）
+  .upload('./data/uploads')              // 上传临时暂存目录（无默认值，防多应用并行冲突）
   .use('/health', 'GET', () => ({ status: 'ok' }))            // 公开
   .useAuth('/profile', (ctx) => ctx.user)                       // 需登录，method 默认 GET
   .useAdmin('/stats', 'GET,POST', (ctx) => doAdminThing(ctx))   // 仅管理员
@@ -68,7 +68,7 @@ const server = createAuthServer()
 | `.static(dirPath)` | 静态资源托管目录（默认不鉴权） | `AuthServer` |
 | `.views(dirPath)` | 视图模板目录（`sendView` 从此读模板）；不配则默认复用 `static` | `AuthServer` |
 | `.title(text)` | 内置页面（登录/注册/管理台）的标题，默认 `xie-auth` | `AuthServer` |
-| `.upload(dirPath, opts?)` | 上传落盘目录（**无默认值**）+ 大小/有效期等配置 | `AuthServer` |
+| `.upload(dirPath, opts?)` | 上传临时暂存目录（**无默认值**）+ 大小/扩展名等配置 | `AuthServer` |
 | `.use(path, method?, handler)` | 注册**公开**接口（不拦截） | `AuthServer` |
 | `.useAuth(path, method?, handler)` | 注册**受保护**接口（需登录） | `AuthServer` |
 | `.useAdmin(path, method?, handler)` | 注册**管理员**接口（需 admin） | `AuthServer` |
@@ -116,20 +116,19 @@ ctx = {
 
 ### 文件上传（multipart/form-data）
 
-上传相关配置集中在 `.upload(dirPath, opts?)`：
+上传相关配置集中在 `.upload(dirPath, opts?)`（`dirPath` 为**临时暂存目录**）：
 
 ```
 .upload(dirPath, {
   maxSize:         '10MB',  // 单文件 & 总大小上限
-  ttl:             '24h',   // 临时文件保留时长，0 = 永久
   allowExtensions?: [],     // 扩展名白名单，如 ['png','jpg','pdf']
   maxFiles?:         10,    // 单请求最大文件数
 })
 ```
 
 - **`dirPath` 无默认值**（防止多个应用并行时落到同一目录冲突），配置了 `.upload` 才启用文件上传。
-- 解析结果进入 `ctx.files`，按字段名分组、同名归数组，采用**落盘 + 两段式生命周期**（详见[文件上传生命周期](#文件上传生命周期)）。
-- 解析后每项：`{ field, filename, storedName, mimeType, size, path, keep(), delete() }`。
+- 解析结果进入 `ctx.files`，按字段名分组、同名归数组，采用**临时暂存 → `transferTo` 转存**模型（类 Spring `MultipartFile`，详见[文件上传生命周期](#文件上传生命周期)）。
+- 每个文件对象：`{ field, filename, storedName, mimeType, size, md5, uploadTime, path, transferTo(dest) }`；其中 `md5` 在写盘时基于内存缓冲**实时计算**，不额外二次读盘。
 
 ---
 
@@ -188,9 +187,11 @@ ctx = {
 
 | 写法 | 含义 |
 |------|------|
-| `{{ expr }}` | 取值并 **HTML 转义**后插入（默认，防 XSS） |
-| `{{{ expr }}}` | 取值后 **原样**插入（渲染富文本 / HTML 片段） |
+| `{{ expr }}` | 取值后 **原样**插入（不转义） |
+| `{{{ expr }}}` | 与 `{{ }}` 行为一致，同样**原样**插入 |
 | `{{ user.name }}` / `{{ list.0.title }}` | 支持点路径与数组下标 |
+
+> ⚠️ **不做任何 HTML 转义**：模板内容的安全性（如防 XSS）由使用者自行保证。
 
 - 缺失变量替换为**空串**；模板文件不存在自动 **404**。
 - 仅做值替换，**不含条件 / 循环 / 逻辑**；需要时在 handler 里先算好再塞进 `model`。
@@ -333,20 +334,25 @@ HMAC 自签 token 无状态，签发后到期前天然有效。为支持"改密�
 
 ## 文件上传生命周期
 
-采用**两段式（临时区 → 转正）**，自动消化"开发者未处理的孤儿文件"：
+采用**临时暂存区模型**（类 Spring `MultipartFile`），库不替开发者长期保管文件——只在请求期间暂存，由 handler 决定去留：
 
 | 阶段 | 行为 |
 |------|------|
-| **落地即临时** | 上传文件先进临时区（`upload(dir)` 目录），按 `<dir>/yyyy-MM-dd/<uuid>.<ext>` 存盘 |
-| **handler 转正** | 对需要保留的文件调用 `file.keep()` → 移出到**库固定的永久区**（`<dir>/kept/`），不再受 ttl 影响 |
-| **未认领自动清理** | 未 `keep()` 的临时文件超过 `ttl`（默认 **24h**）由清理器删除 |
+| **落地即临时** | 上传文件写入临时区（`.upload(dir)` 目录），按 `<dir>/<uuid>.<ext>` 存盘；写盘时基于内存缓冲实时算出 `md5` |
+| **handler 拿文件对象** | `ctx.files.<field>[0]` 提供 `{ filename, size, md5, uploadTime, path, transferTo(dest) }`，`path` 在本请求 handler 期间可读 |
+| **需要保留则转存** | 调用 `file.transferTo(dest)` 将临时文件**移动**到正式位置（重命名，跨设备回退复制）；`dest` 为目录则以原始文件名落入，为路径则按确切路径存放（自动建父目录），返回最终绝对路径 |
+| **请求结束自动清理** | handler 结束（成功或抛错）后，**未被 `transferTo` 转走**的临时文件一律删除 |
+| **启动清孤儿** | 每次服务启动 `purgeStale()` 清空临时区，回收上次进程崩溃 / 重启遗留的孤儿文件 |
 
-清理器实现：
-- **基于文件 mtime 扫描**，不用内存计时器 → 服务重启 / `stop()` 后依然有效，启动时做一次全量扫描；周期可配（默认每 30 分钟）。
-- `ttl = 0` 退化为"全部永久保留"，由开发者自行管理。
-- 除 `keep()` 外，`file.delete()` 可主动删除任意已存文件。
+```js
+.use('/upload', 'POST', (ctx) => {
+  const f = ctx.files.file[0]
+  const abs = f.transferTo('/data/attachments/')   // 保留：转存到正式目录，返回最终路径
+  return { saved: abs, md5: f.md5, size: f.size }   // 未 transferTo 的文件请求结束即删
+})
+```
 
-> 安全：文件名净化 + 禁止 `..`/绝对路径；落盘一律用 uuid 名，原始名仅供展示；可选扩展名/MIME 白名单；上传目录不通过 `.static` 暴露执行。
+> 安全：文件名净化 + 禁止 `..`/绝对路径；临时落盘一律用 uuid 名，原始名仅供展示与 `transferTo` 到目录时的默认命名；可选扩展名白名单与单请求文件数上限；临时目录不通过 `.static` 暴露。
 
 ---
 
@@ -360,7 +366,6 @@ HMAC 自签 token 无状态，签发后到期前天然有效。为支持"改密�
 | 上传落盘目录 | `.upload()` | **无默认值**（未配置则不启用上传） |
 | 服务端口 | `.serve()` | `3333` |
 | 上传大小上限 | `.upload()` | `10MB` |
-| 临时文件有效期 | `.upload()` | `24h` |
 | 单请求最大文件数 | `.upload()` | `10` |
 | `method` | `.use/.useAuth/.useAdmin` | `GET` |
 

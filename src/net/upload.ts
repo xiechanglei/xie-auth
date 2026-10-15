@@ -1,40 +1,49 @@
-import { mkdirSync, renameSync, unlinkSync, statSync, existsSync, readdirSync, writeFileSync } from 'node:fs'
-import { join, resolve, extname } from 'node:path'
+import { mkdirSync, renameSync, unlinkSync, statSync, existsSync, readdirSync, writeFileSync, copyFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { join, resolve, extname, dirname, sep } from 'node:path'
 import type { MultipartPart } from './multipart.js'
 import type { FilesField, ResolvedUploadConfig, UploadedFile, UploadedFileMeta } from '../types.js'
 import { sanitizeFilename } from './multipart.js'
 import { uuid } from '../crypto.js'
 
-/** 当天日期目录名 yyyy-MM-dd */
-function dateDir(): string {
-  const d = new Date()
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
-}
-
 function ensureDir(dir: string): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
 }
 
+/** 移动文件，跨设备（EXDEV）回退为复制 + 删除 */
+function moveFile(from: string, to: string): void {
+  try {
+    renameSync(from, to)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EXDEV') {
+      copyFileSync(from, to)
+      unlinkSync(from)
+    } else {
+      throw err
+    }
+  }
+}
+
 /**
- * 上传文件管理：落盘到临时区、提供 keep()/delete()、以及基于 mtime 的过期清理器。
+ * 上传文件管理（临时暂存区模型，类 Spring MultipartFile）：
+ * - 落盘到 config.dir 临时区，handler 期间拿到含 md5/size/uploadTime 的文件对象；
+ * - 需保留时通过 file.transferTo(dest) 转存到正式位置（移出临时区）；
+ * - 请求结束后由 cleanupTemp 删除未被转存的临时文件；
+ * - 服务启动时 purgeStale() 清空临时区，回收上次崩溃 / 重启遗留的孤儿文件。
  */
 export class UploadManager {
   private config: ResolvedUploadConfig
-  private timer: ReturnType<typeof setInterval> | null = null
 
   constructor(config: ResolvedUploadConfig) {
     this.config = config
     ensureDir(config.dir)
-    ensureDir(config.keptDir)
   }
 
-  /** 将 multipart 中的文件部分落盘，返回按字段分组的 UploadedFile */
-  persist(parts: MultipartPart[]): FilesField {
+  /** 将 multipart 中的文件部分落盘；按字段分组返回，同时把创建的临时路径 push 进 tempPaths（供调用方兜底清理） */
+  persist(parts: MultipartPart[], tempPaths: string[]): FilesField {
     const files: FilesField = {}
     const dir = this.config.dir
-    const dayDir = join(dir, dateDir())
-    ensureDir(dayDir)
+    ensureDir(dir)
 
     let count = 0
     for (const part of parts) {
@@ -50,7 +59,7 @@ export class UploadManager {
       const cleanName = sanitizeFilename(part.filename)
       const ext = extname(cleanName)
       const storedName = `${uuid()}${ext}`
-      const filePath = join(dayDir, storedName)
+      const filePath = join(dir, storedName)
 
       if (this.config.allowExtensions && this.config.allowExtensions.length > 0) {
         const extNoDot = ext.replace('.', '').toLowerCase()
@@ -59,14 +68,21 @@ export class UploadManager {
         }
       }
 
+      // 写盘 + 基于内存缓冲算 md5：数据已在内存，无额外二次读盘
       writeFileSync(filePath, part.data)
+      const absTemp = resolve(filePath)
+      tempPaths.push(absTemp)
+      const md5 = createHash('md5').update(part.data).digest('hex')
+
       const meta: UploadedFileMeta = {
         field: part.field,
         filename: cleanName,
         storedName,
         mimeType: part.contentType,
         size: part.data.length,
-        path: resolve(filePath),
+        md5,
+        uploadTime: Date.now(),
+        path: absTemp,
       }
       const file = this.wrap(meta)
       if (!files[part.field]) files[part.field] = []
@@ -75,67 +91,61 @@ export class UploadManager {
     return files
   }
 
-  /** 包装成带 keep()/delete() 行为的对象 */
+  /** 包装成带 transferTo 行为的文件对象 */
   private wrap(meta: UploadedFileMeta): UploadedFile {
-    const cfg = this.config
     return {
       ...meta,
-      keep(): string {
-        const target = join(cfg.keptDir, meta.storedName)
-        ensureDir(cfg.keptDir)
-        renameSync(meta.path, target)
-        return resolve(target)
-      },
-      delete(): void {
-        if (existsSync(meta.path)) unlinkSync(meta.path)
+      transferTo(dest: string): string {
+        const finalPath = resolveDest(meta, dest)
+        ensureDir(dirname(finalPath))
+        moveFile(meta.path, finalPath)
+        return finalPath
       },
     }
   }
 
   /**
-   * 启动清理器：立即扫一次，然后周期扫描。
-   * 只清临时区（keptDir 永久区不动），基于 mtime，ttl=0 时不清理。
+   * 服务启动时清空临时暂存区：逐个删除 dir 下的普通文件（保留子目录，避免误删）。
+   * 回收上一次进程崩溃 / 重启时未来得及清理的孤儿临时文件。
    */
-  startSweeper(intervalMs = 30 * 60 * 1000): void {
-    if (this.config.ttlMs <= 0) return
-    if (this.timer) return
-    this.sweepOnce()
-    this.timer = setInterval(() => this.sweepOnce(), intervalMs)
-    // 不阻塞进程退出
-    if (typeof this.timer.unref === 'function') this.timer.unref()
-  }
-
-  stopSweeper(): void {
-    if (this.timer) {
-      clearInterval(this.timer)
-      this.timer = null
-    }
-  }
-
-  /** 删除临时区中超过 ttl 的文件 */
-  sweepOnce(): void {
-    if (this.config.ttlMs <= 0) return
-    const now = Date.now()
+  purgeStale(): void {
     const root = this.config.dir
-    if (!existsSync(root)) return
+    if (!existsSync(root)) {
+      ensureDir(root)
+      return
+    }
     for (const entry of readdirSync(root)) {
-      const dayPath = join(root, entry)
-      let st
+      const fp = join(root, entry)
       try {
-        st = statSync(dayPath)
+        if (statSync(fp).isFile()) unlinkSync(fp)
       } catch {
-        continue
-      }
-      if (!st.isDirectory()) continue
-      for (const f of readdirSync(dayPath)) {
-        const fp = join(dayPath, f)
-        try {
-          const fst = statSync(fp)
-          if (now - fst.mtimeMs > this.config.ttlMs) unlinkSync(fp)
-        } catch {
-          // 忽略竞态
-        }
+        // 忽略竞态 / 权限问题
       }
     }
   }
+
+  /** 请求结束后清理：删除仍存在的临时文件（已被 transferTo 移走的自然跳过） */
+  static cleanupTemp(tempPaths: string[]): void {
+    for (const p of tempPaths) {
+      try {
+        if (existsSync(p)) unlinkSync(p)
+      } catch {
+        // 忽略竞态
+      }
+    }
+  }
+}
+
+/** 解析 transferTo 目标：目录→用原始文件名落入；否则视为确切文件路径 */
+function resolveDest(meta: UploadedFileMeta, dest: string): string {
+  const looksDir = dest.endsWith('/') || dest.endsWith(sep)
+  const abs = resolve(dest)
+  if (looksDir) return join(abs, meta.filename || meta.storedName)
+  let isDir = false
+  try {
+    isDir = statSync(abs).isDirectory()
+  } catch {
+    isDir = false
+  }
+  return isDir ? join(abs, meta.filename || meta.storedName) : abs
 }

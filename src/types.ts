@@ -126,26 +126,33 @@ export const DEFAULT_SETTINGS: Settings = {
   tokenTtl: 3600 * 12,
 }
 
-/** 单个上传文件在内存中的描述（落盘后） */
+/** 单个上传文件在内存中的描述（已落临时区） */
 export interface UploadedFileMeta {
   /** 表单字段名 */
   field: string
   /** 客户端提交的原始文件名（仅展示） */
   filename: string
-  /** 落盘使用的 uuid 名 */
+  /** 临时区落盘使用的 uuid 名 */
   storedName: string
   mimeType: string
   size: number
-  /** 落盘的绝对路径（临时区） */
+  /** 内容 MD5（十六进制）；写入临时文件时基于内存缓冲实时算出，不重复读盘 */
+  md5: string
+  /** 上传（落临时区）时间，毫秒时间戳 */
+  uploadTime: number
+  /** 临时文件的绝对路径（handler 期间可读；未 transferTo 则请求结束后自动删除） */
   path: string
 }
 
-/** handler 可操作的上传文件对象 */
+/** handler 可操作的上传文件对象（类 Spring MultipartFile） */
 export interface UploadedFile extends UploadedFileMeta {
-  /** 转正：移动到永久区，返回新绝对路径；不受 ttl 清理 */
-  keep(): string
-  /** 主动删除该文件 */
-  delete(): void
+  /**
+   * 将临时文件转存到正式位置（重命名，跨设备自动回退为复制）。
+   * - dest 为目录（已存在或以 `/` 结尾）→ 以原始文件名放入该目录；
+   * - dest 为文件路径 → 转存为该确切路径（自动创建父目录）。
+   * 返回最终绝对路径；转存后该文件不再受临时清理影响。
+   */
+  transferTo(dest: string): string
 }
 
 /** 上传文件集合：按字段名分组，同名归数组 */
@@ -202,7 +209,7 @@ export interface Ctx {
   ): BufferResponse
   /** 返回纯文本（text/plain） */
   sendText(text: string, opts?: { status?: number; headers?: Record<string, string> }): TextResponse
-  /** 渲染视图目录下的模板（{{expr}} 转义、{{{expr}}} 原样）；绕过 JSON 封装，模板不存在自动 404 */
+  /** 渲染视图目录下的模板（{{expr}} / {{{expr}}} 均原样插入，不转义）；绕过 JSON 封装，模板不存在自动 404 */
   sendView(
     viewPath: string,
     model?: Record<string, unknown>,
@@ -240,10 +247,9 @@ export interface GuardRule {
   role?: UserRole
 }
 
-/** 上传配置（dirPath 为必填，无默认） */
+/** 上传配置（dirPath 为临时暂存目录，必填、无默认） */
 export interface UploadOptions {
   maxSize?: string | number
-  ttl?: string | number
   allowExtensions?: string[]
   maxFiles?: number
 }
@@ -251,9 +257,7 @@ export interface UploadOptions {
 /** 解析后的上传配置 */
 export interface ResolvedUploadConfig {
   dir: string
-  keptDir: string
   maxSizeBytes: number
-  ttlMs: number
   allowExtensions: string[] | null
   maxFiles: number
 }

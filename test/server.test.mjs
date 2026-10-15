@@ -1,6 +1,7 @@
 // 端到端功能测试：真正启动 AuthServer，覆盖注册/登录/鉴权/改密失效/IP/静态/404
 import { createAuthServer } from '../dist/index.js'
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -30,6 +31,10 @@ writeFileSync(
   join(viewsDir, 'user.html'),
   '<h1>{{user.name}}</h1><p>{{{user.bio}}}</p><p>esc={{user.bio}}</p><p>miss=[{{user.nothing}}]</p>',
 )
+// 预先在上传目录放一个“上次崩溃遗留”的孤儿文件，验证启动时 purgeStale 清理
+mkdirSync(uploadDir, { recursive: true })
+writeFileSync(join(uploadDir, 'stale-orphan.tmp'), 'orphan')
+const permDir = join(work, 'perm')
 
 const PORT = 39717
 const BASE = `http://127.0.0.1:${PORT}`
@@ -39,8 +44,21 @@ const server = createAuthServer()
   .static(staticDir)
   .title('MyApp 控制台')
   .views(viewsDir)
-  .upload(uploadDir, { maxSize: '5MB', ttl: '0' })
+  .upload(uploadDir, { maxSize: '5MB' })
   .use('/ping', () => 'pong')
+  .use('/up', 'POST', (ctx) => {
+    const f = ctx.files.file?.[0]
+    if (!f) throw new Error('未收到文件')
+    const info = {
+      filename: f.filename,
+      size: f.size,
+      md5: f.md5,
+      uploadTimeType: typeof f.uploadTime,
+      tempExistsDuringHandler: existsSync(f.path),
+      kept: ctx.query.to ? f.transferTo(join(permDir, ctx.query.to)) : null,
+    }
+    return info
+  })
   .useAuth('/whoami', (ctx) => ctx.user)
   .useAdmin('/admin-only', () => ({ ok: true }))
   .use('/view', (ctx) => ctx.sendView('/user.html', { user: { name: 'Tom', bio: '<b>Hi</b>' } }))
@@ -214,7 +232,7 @@ async function main() {
   assert(view.headers.get('content-type')?.includes('text/html'), 'sendView 返回 text/html')
   assert(viewHtml.includes('<h1>Tom</h1>'), 'sendView 插值 {{user.name}}')
   assert(viewHtml.includes('<p><b>Hi</b></p>'), 'sendView {{{ }}} 原样输出 HTML')
-  assert(viewHtml.includes('esc=&lt;b&gt;Hi&lt;/b&gt;'), 'sendView {{ }} 默认转义防 XSS')
+  assert(viewHtml.includes('esc=<b>Hi</b>'), 'sendView {{ }} 也原样输出（不转义）')
   assert(viewHtml.includes('miss=[]'), 'sendView 缺失变量替换为空串')
   const viewMiss = await fetch(`${BASE}/view-miss`)
   assert(viewMiss.status === 404, 'sendView 模板不存在返回 404')
@@ -228,6 +246,27 @@ async function main() {
   assert(setCookies.some((c) => c.startsWith('pref=a%20b')), 'ctx.cookie() 值经 URL 编码')
   const readck = await (await fetch(`${BASE}/readck`, { headers: { cookie: 'theme=dark' } })).json()
   assert(readck.data.theme === 'dark' && typeof readck.data.ua === 'string', 'ctx.cookies / ctx.get 可读请求信息')
+
+  console.log('\n[文件上传：md5 / transferTo / 临时清理]')
+  // 启动时 purgeStale 已清除预置的孤儿文件
+  assert(!existsSync(join(uploadDir, 'stale-orphan.tmp')), '启动时 purgeStale 清理遗留孤儿文件')
+  const content = 'HELLO-UPLOAD'
+  const expectMd5 = createHash('md5').update(content).digest('hex')
+  // 1) 转存：transferTo 到正式目录
+  const fd1 = new FormData()
+  fd1.append('file', new Blob([content], { type: 'text/plain' }), 'note.txt')
+  const up1 = await (await fetch(`${BASE}/up?to=keep.txt`, { method: 'POST', body: fd1 })).json()
+  assert(up1.success && up1.data.filename === 'note.txt' && up1.data.size === content.length, '上传文件对象含 filename/size')
+  assert(up1.data.md5 === expectMd5, 'md5 与内容一致（写盘时实时计算）')
+  assert(up1.data.uploadTimeType === 'number', '上传文件对象含 uploadTime')
+  assert(up1.data.tempExistsDuringHandler === true, 'handler 期间临时文件可读')
+  assert(up1.data.kept && existsSync(up1.data.kept) && readFileSync(up1.data.kept, 'utf-8') === content, 'transferTo 将临时文件转存到正式位置')
+  // 2) 不转存：请求结束后临时文件被自动清理
+  const fd2 = new FormData()
+  fd2.append('file', new Blob(['IGNORED'], { type: 'text/plain' }), 'drop.txt')
+  const up2 = await (await fetch(`${BASE}/up`, { method: 'POST', body: fd2 })).json()
+  assert(up2.success && up2.data.kept === null, '未 transferTo 时 kept 为 null')
+  assert(readdirSync(uploadDir).length === 0, 'handler 结束后临时文件被自动清理（uploadDir 为空）')
 
   server.stop()
   rmSync(work, { recursive: true, force: true })
