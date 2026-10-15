@@ -1,7 +1,7 @@
 {
   "name": "@xie-work/xie-auth",
   "version": "1.0.0",
-  "description": "A TypeScript authentication library for third-party Node.js projects.",
+  "description": "嵌入式认证服务库：为第三方 Node.js 项目接管用户、注册、登录、鉴权与权限管理。链式 API 声明接口即可，文件存储、零外部运行时依赖。",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -12,11 +12,13 @@
       "import": "./dist/index.js",
       "require": "./dist/index.cjs",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist"
   ],
+  "sideEffects": false,
   "engines": {
     "node": ">=18"
   },
@@ -28,16 +30,34 @@
     "test": "node test/server.test.mjs",
     "test:build": "npm run build && npm run test",
     "clean": "rimraf dist",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run test:build"
   },
   "keywords": [
     "auth",
+    "authentication",
+    "authorization",
+    "session",
+    "cookie",
+    "rbac",
+    "embeddable",
+    "file-storage",
     "typescript",
-    "node"
+    "node",
+    "vite"
   ],
   "author": "",
   "license": "MIT",
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xie-work/xie-auth.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xie-work/xie-auth/issues"
+  },
+  "homepage": "https://github.com/xie-work/xie-auth#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "rimraf": "^6.0.1",

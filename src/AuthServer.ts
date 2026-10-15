@@ -54,6 +54,7 @@ interface GuardCompiled extends GuardRule {
 export class AuthServer {
   private storePath = DEFAULT_STORE
   private staticDir = DEFAULT_STATIC
+  private pageTitle = 'xie-auth'
   private uploadOpts: { dir: string; opts?: UploadOptions } | null = null
   private routes: Route[] = []
   private guards: GuardCompiled[] = []
@@ -71,6 +72,12 @@ export class AuthServer {
 
   static(dirPath: string): this {
     this.staticDir = dirPath
+    return this
+  }
+
+  /** 内置页面标题（登录/注册/管理台），默认 xie-auth */
+  title(text: string): this {
+    this.pageTitle = text || 'xie-auth'
     return this
   }
 
@@ -131,6 +138,7 @@ export class AuthServer {
     this.server.listen(port)
 
     console.log('[xie-auth] 服务已启动')
+    console.log('  title     :', this.pageTitle)
     console.log('  userStore :', resolve(this.storePath))
     console.log('  static    :', resolve(this.staticDir))
     console.log('  upload    :', this.uploadOpts ? resolve(this.uploadOpts.dir) : '(未配置)')
@@ -257,11 +265,11 @@ export class AuthServer {
       return true
     }
     if (pathname === '/auth/login.html') {
-      sendHtml(res, 200, loginPage())
+      sendHtml(res, 200, loginPage(this.pageTitle))
       return true
     }
     if (pathname === '/auth/register.html') {
-      sendHtml(res, 200, registerPage())
+      sendHtml(res, 200, registerPage(this.pageTitle))
       return true
     }
     if (pathname === '/auth/manager.html') {
@@ -271,7 +279,7 @@ export class AuthServer {
         sendRedirect(res, `/auth/login.html?redirect=${encodeURIComponent(pathname)}`)
         return true
       }
-      sendHtml(res, 200, managerPage())
+      sendHtml(res, 200, managerPage(this.pageTitle))
       return true
     }
     return false

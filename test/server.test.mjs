@@ -29,6 +29,7 @@ const BASE = `http://127.0.0.1:${PORT}`
 const server = createAuthServer()
   .userStore(storeFile)
   .static(staticDir)
+  .title('MyApp 控制台')
   .upload(uploadDir, { maxSize: '5MB', ttl: '0' })
   .use('/ping', () => 'pong')
   .useAuth('/whoami', (ctx) => ctx.user)
@@ -115,9 +116,52 @@ async function main() {
 
   console.log('\n[内置页面]')
   const loginPage = await fetch(`${BASE}/auth/login.html`)
-  assert(loginPage.ok && (await loginPage.text()).includes('登录'), '内置登录页可访问')
+  const loginHtml = await loginPage.text()
+  assert(loginPage.ok && loginHtml.includes('登录'), '内置登录页可访问')
+  assert(loginHtml.includes('MyApp 控制台'), '页面标题可通过 .title() 配置')
+  assert(loginHtml.includes('id="toAdmin"'), '登录页提供“登录后进入管理后台”选项')
   const guardJs = await fetch(`${BASE}/auth/xie-auth.js`)
   assert(guardJs.ok && (await guardJs.text()).includes('XieAuth'), '客户端守卫脚本可访问')
+
+  console.log('\n[管理员禁用用户]')
+  // 上面改密已使旧 cookie 失效，用新密码重新登录 admin
+  const adminReLogin = await fetch(`${BASE}/auth/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'admin0', password: 'newsecret' }),
+  })
+  const adminCookie = adminReLogin.headers.get('set-cookie').split(';')[0]
+  // 开放注册且免审核，便于创建普通用户
+  await fetch(`${BASE}/auth/api/settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', cookie: adminCookie },
+    body: JSON.stringify({ openRegistration: true, requireApproval: false }),
+  })
+  const reg2 = await (
+    await fetch(`${BASE}/auth/api/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'alice', password: 'pw123456' }),
+    })
+  ).json()
+  assert(reg2.success && reg2.data.status === 'active', '免审核注册直接 active')
+
+  const login2Res = await fetch(`${BASE}/auth/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'alice', password: 'pw123456' }),
+  })
+  const cookie2 = login2Res.headers.get('set-cookie').split(';')[0]
+  assert((await (await fetch(`${BASE}/whoami`, { headers: { cookie: cookie2 } })).json()).data.username === 'alice', 'alice 登录后可访问受保护路由')
+
+  const disableRes = await (
+    await fetch(`${BASE}/auth/api/users/${reg2.data.id}/disable`, { method: 'POST', headers: { cookie: adminCookie } })
+  ).json()
+  assert(disableRes.success && disableRes.data.status === 'disabled', 'admin 禁用用户成功')
+  const whoAfterDisable = await fetch(`${BASE}/whoami`, { headers: { cookie: cookie2 } })
+  assert(whoAfterDisable.status === 401, '被禁用用户旧 token 立即失效（401）')
+  const loginAfterDisable = await (await fetch(`${BASE}/auth/api/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'alice', password: 'pw123456' }) })).json()
+  assert(!loginAfterDisable.success && /停用/.test(loginAfterDisable.message), '被禁用用户无法重新登录')
 
   server.stop()
   rmSync(work, { recursive: true, force: true })

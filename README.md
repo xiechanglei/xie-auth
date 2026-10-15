@@ -39,6 +39,7 @@ import { createAuthServer } from '@xie-work/xie-auth'
 const server = createAuthServer()
   .userStore('./data/users.json')        // 可省略，默认 ~/.xie-auth/users.json
   .static('./public')                    // 可省略，默认入口文件同级的 public
+  .title('我的系统')                   // 可省略，内置页面标题默认 xie-auth
   .upload('./data/uploads')              // 上传落盘目录（无默认值，防多应用并行冲突）
   .use('/health', 'GET', () => ({ status: 'ok' }))            // 公开
   .useAuth('/profile', (ctx) => ctx.user)                       // 需登录，method 默认 GET
@@ -49,7 +50,7 @@ const server = createAuthServer()
 // server.stop() 停止；停止后可再次 serve() 重启
 ```
 
-启动时库会打印最终生效的配置：`userStore`、`static`、`port`。
+启动时库会打印最终生效的配置：`title`、`userStore`、`static`、`port`。
 
 ---
 
@@ -62,6 +63,7 @@ const server = createAuthServer()
 | `createAuthServer()` | 工厂函数，返回可链式构建器 | `AuthServer` |
 | `.userStore(filePath)` | 用户信息 + 设置的**存储文件**（文件存储，非数据库；不存在时自动创建） | `AuthServer` |
 | `.static(dirPath)` | 静态资源托管目录（默认不鉴权） | `AuthServer` |
+| `.title(text)` | 内置页面（登录/注册/管理台）的标题，默认 `xie-auth` | `AuthServer` |
 | `.upload(dirPath, opts?)` | 上传落盘目录（**无默认值**）+ 大小/有效期等配置 | `AuthServer` |
 | `.use(path, method?, handler)` | 注册**公开**接口（不拦截） | `AuthServer` |
 | `.useAuth(path, method?, handler)` | 注册**受保护**接口（需登录） | `AuthServer` |
@@ -151,6 +153,8 @@ ctx = {
 库自动挂载以下内容（均在 `/auth/` 下），开发者无需实现：
 
 - **页面**：`/auth/login.html`、`/auth/register.html`、`/auth/manager.html`（管理员专用）
+  - 登录页提供“**登录后进入管理后台**”选项（无 `?redirect` 时勾选则跳 `/auth/manager.html`）。
+  - 页面标题可通过 `.title(text)` 配置（默认 `xie-auth`）。
 - **接口**：注册、登录、登出、`GET /auth/api/me`（返回当前用户），以及管理接口（审核 / 停用 / 改密 / 设置注册开关 / IP 名单等，均 admin only）
 - **客户端守卫脚本**：`/auth/xie-auth.js`（见[登录跳转](#登录跳转客户端守卫--声明式守卫)）
 
