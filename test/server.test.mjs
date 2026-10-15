@@ -25,6 +25,10 @@ mkdirSync(staticDir, { recursive: true })
 writeFileSync(join(staticDir, 'index.html'), '<h1>HOME</h1>')
 const downloadFile = join(work, '报表.txt')
 writeFileSync(downloadFile, 'FILE-DATA-中文内容')
+// 固定内容的媒体文件，用于 Range / 条件缓存测试（100 字节）
+const mediaFile = join(work, 'media.bin')
+const mediaContent = '0123456789'.repeat(10)
+writeFileSync(mediaFile, mediaContent)
 const viewsDir = join(work, 'views')
 mkdirSync(viewsDir, { recursive: true })
 writeFileSync(
@@ -77,6 +81,7 @@ const server = createAuthServer()
   .use('/csv', (ctx) => ctx.sendBuffer(Buffer.from('a,b,c'), { contentType: 'text/csv', filename: 'data.csv' }))
   .use('/plain', (ctx) => ctx.sendText('hello plain'))
   .use('/missfile', (ctx) => ctx.sendFile(join(work, 'not-exist.bin')))
+  .use('/media', 'GET,HEAD', (ctx) => ctx.sendFile(mediaFile, { etag: true, lastModified: true, range: true, download: false }))
   .serve(PORT)
 
 async function waitForReady() {
@@ -267,6 +272,58 @@ async function main() {
   const up2 = await (await fetch(`${BASE}/up`, { method: 'POST', body: fd2 })).json()
   assert(up2.success && up2.data.kept === null, '未 transferTo 时 kept 为 null')
   assert(readdirSync(uploadDir).length === 0, 'handler 结束后临时文件被自动清理（uploadDir 为空）')
+
+  console.log('\n[文件条件缓存与 Range]')
+  // 全量：带 ETag / Last-Modified / Accept-Ranges
+  const m0 = await fetch(`${BASE}/media`)
+  const m0text = await m0.text()
+  assert(m0.status === 200 && m0text === mediaContent, 'GET /media 全量返回内容')
+  assert(m0.headers.get('accept-ranges') === 'bytes', '全量响应带 Accept-Ranges: bytes')
+  const etag = m0.headers.get('etag')
+  const lastModified = m0.headers.get('last-modified')
+  assert(!!etag && !!lastModified, '响应带 ETag 与 Last-Modified')
+
+  // If-None-Match 命中 → 304
+  const m1 = await fetch(`${BASE}/media`, { headers: { 'if-none-match': etag } })
+  assert(m1.status === 304, 'If-None-Match 命中返回 304')
+
+  // If-Modified-Since 未变更（未来时间）→ 304
+  const m2 = await fetch(`${BASE}/media`, { headers: { 'if-modified-since': new Date(Date.now() + 60000).toUTCString() } })
+  assert(m2.status === 304, 'If-Modified-Since 未变更返回 304')
+
+  // Range 0-4 → 206
+  const m3 = await fetch(`${BASE}/media`, { headers: { range: 'bytes=0-4' } })
+  assert(m3.status === 206 && (await m3.text()) === '01234' && m3.headers.get('content-range') === 'bytes 0-4/100', 'Range bytes=0-4 返回 206 片段')
+  assert(m3.headers.get('content-length') === '5', '206 的 Content-Length 为片段长度')
+
+  // 后缀 bytes=-3 → 末尾 3 字节
+  const m4 = await fetch(`${BASE}/media`, { headers: { range: 'bytes=-3' } })
+  assert(m4.status === 206 && (await m4.text()) === '789' && m4.headers.get('content-range') === 'bytes 97-99/100', '后缀 Range bytes=-3 返回末尾片段')
+
+  // 开尾 bytes=50-
+  const m5 = await fetch(`${BASE}/media`, { headers: { range: 'bytes=50-' } })
+  assert(m5.status === 206 && (await m5.text()) === mediaContent.slice(50), '开尾 Range bytes=50- 返回剩余')
+
+  // 越界 → 416
+  const m6 = await fetch(`${BASE}/media`, { headers: { range: 'bytes=1000-' } })
+  assert(m6.status === 416 && m6.headers.get('content-range') === 'bytes */100', '越界 Range 返回 416')
+
+  // If-Range 不符 → 忽略 Range 回全量
+  const m7 = await fetch(`${BASE}/media`, { headers: { range: 'bytes=0-4', 'if-range': '"nope"' } })
+  assert(m7.status === 200 && (await m7.text()) === mediaContent, 'If-Range 不匹配忽略 Range 回全量 200')
+
+  // HEAD + Range：206 头无 body
+  const m8 = await fetch(`${BASE}/media`, { method: 'HEAD', headers: { range: 'bytes=0-9' } })
+  assert(m8.status === 206 && m8.headers.get('content-length') === '10' && (await m8.text()) === '', 'HEAD+Range 返回 206 头但无 body')
+
+  // 多区间（MVP）忽略 → 200
+  const m9 = await fetch(`${BASE}/media`, { headers: { range: 'bytes=0-1,5-6' } })
+  assert(m9.status === 200 && (await m9.text()) === mediaContent, '多区间 Range（MVP）忽略回全量 200')
+
+  // 默认 sendFile（未 opt-in）：无 ETag / Accept-Ranges
+  const dl0 = await fetch(`${BASE}/dl`)
+  await dl0.text()
+  assert(dl0.status === 200 && !dl0.headers.get('etag') && !dl0.headers.get('accept-ranges'), '默认 sendFile（未 opt-in）不带 ETag/Accept-Ranges')
 
   server.stop()
   rmSync(work, { recursive: true, force: true })

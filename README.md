@@ -174,6 +174,44 @@ ctx = {
 
 ---
 
+## 文件缓存与 Range（`sendFile`）
+
+面向媒体 / 静态资源服务，`ctx.sendFile` 可选开启**条件缓存**（协商 304）与**断点续传 / 拖动**（Range 206）。均为 **opt-in**，不传相关 opts 时保持原来的全量 200 行为：
+
+```js
+// 图片 / 视频内联预览，支持缓存与 Range
+.use('/media/:name', (ctx) =>
+  ctx.sendFile(`/data/media/${ctx.params.name}`, {
+    download: false,
+    etag: true,          // 自动生成 ETag = "<mtime>-<size>"（不读文件内容）
+    lastModified: true,  // 取文件 mtime 作为 Last-Modified
+    cacheControl: 'public, max-age=3600', // 原样下发（不传则不下发）
+    range: true,         // 支持单区间 Range → 206 / 416
+  }),
+)
+```
+
+| opts | 默认 | 说明 |
+|------|:----:|------|
+| `etag` | 关 | `true` 自动生成 `"<mtimeMs>-<size>"`（强校验、零额外读盘）；传字符串为自定义 |
+| `lastModified` | 关 | `true` 取文件 mtime；传 `Date` 为指定时间 |
+| `cacheControl` | 不下发 | `Cache-Control` 头原文，如 `'public, max-age=3600, immutable'` |
+| `range` | 关 | 支持 `Range` 头（单区间） |
+
+**处理优先级**（符合 RFC 9110 简化语义）：
+
+1. **条件命中→ 304**：`If-None-Match` 匹配 ETag（弱比较），或无 `If-None-Match` 时 `If-Modified-Since` ≥ 文件 mtime → 返回 304（无 body）。
+2. **Range→ 206 / 416**：开启且带 `Range` 时，先查 `If-Range`（不匹配则忽略 Range 回全量）；合法单区间 → `206` + `Content-Range` 流式输出片段；起始越界 → `416`。
+3. **全量 200**：带 `Accept-Ranges: bytes`（仅 `range: true` 时下发）。
+
+**说明**：
+
+- **仅支持单区间**（覆盖视频拖动 / 断点续传绝大多数场景）；多区间请求（如 `bytes=0-1,5-6`）按忽略处理、回全量 200。
+- **HEAD** 同样参与缓存 / Range 判定（只发头不发体）；需路由声明支持 HEAD（如 `.use(path, 'GET,HEAD', ...)`）。
+- ETag 基于 mtime+size，不读文件内容，因此不破坏流式传输；文件被原地修改后 mtime/size 变化会自动使缓存失效。
+
+---
+
 ## 视图渲染 `ctx.sendView()`
 
 从**视图目录**（`.views(dir)` 配置，不配则复用 `static`）读取模板，用 `model` 做插值后作为 `text/html` 返回：
@@ -389,7 +427,7 @@ xie-auth/
 │   ├── index.ts            # 入口：导出 createAuthServer / AuthServer / 类型
 │   ├── AuthServer.ts       # 链式 Builder + 请求分发流水线 + 内置路由
 │   ├── types.ts / crypto.ts / store.ts / router.ts / util.ts / ipFilter.ts
-│   ├── net/                # multipart / request / response / upload / cookie / template
+│   ├── net/                # multipart / request / response / upload / cookie / template / fileStream
 │   └── auth/               # session / pages / guardScript
 ├── test/                   # 针对构建产物（dist/）的端到端功能测试
 │   └── server.test.mjs

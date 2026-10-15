@@ -2,7 +2,8 @@ import type { ServerResponse } from 'node:http'
 import { statSync, createReadStream } from 'node:fs'
 import { resolve, basename, extname } from 'node:path'
 import { RAW_RESPONSE } from '../types.js'
-import type { ApiResult, RawResponse } from '../types.js'
+import type { ApiResult, FileResponse, RawResponse } from '../types.js'
+import { computeValidators, isFresh, parseRange, rangePreconditionOk } from './fileStream.js'
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -65,6 +66,89 @@ function withDefaults(
   return { ...base, ...(d?.headers ?? {}), ...(extra ?? {}) }
 }
 
+/**
+ * 发送磁盘文件：支持条件缓存（ETag / Last-Modified → 304）与单区间 Range（206 / 416）。
+ * 两者均为 opt-in：r.etag / r.lastModified / r.range 缺省关闭，保持全量 200 行为。
+ * Cookie 已由调用方 sendRawResponse 统一下发，此处不重复。
+ */
+function serveFile(res: ServerResponse, r: FileResponse, d?: ResponseDefaults): void {
+  const req = res.req
+  const method = (req?.method ?? 'GET').toUpperCase()
+  const filePath = resolve(r.filePath)
+  let st
+  try {
+    st = statSync(filePath)
+  } catch {
+    st = undefined
+  }
+  if (!st || !st.isFile()) {
+    const text = JSON.stringify({ success: false, message: '文件不存在', data: null })
+    res.writeHead(404, withDefaults({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(text) }, d))
+    res.end(text)
+    return
+  }
+
+  const status = r.status ?? d?.status ?? 200
+  const validators = computeValidators(st, r)
+
+  // 缓存 / 用户自定义头（304 与实体响应共用）
+  const cacheHeaders: Record<string, string> = {}
+  if (r.cacheControl) cacheHeaders['Cache-Control'] = r.cacheControl
+  if (validators.etag) cacheHeaders['ETag'] = validators.etag
+  if (validators.lastModified) cacheHeaders['Last-Modified'] = validators.lastModified.toUTCString()
+  const shared = withDefaults(cacheHeaders, d, r.headers)
+
+  // 1) 条件命中 → 304（不带实体头与 body）
+  if ((method === 'GET' || method === 'HEAD') && req && isFresh(req.headers, validators)) {
+    res.writeHead(304, shared)
+    res.end()
+    return
+  }
+
+  const fname = r.filename ?? basename(filePath)
+  const entity: Record<string, string | number> = {
+    'Content-Type': r.mimeType ?? guessContentType(filePath),
+    'Content-Disposition': contentDisposition(r.download === false ? 'inline' : 'attachment', fname),
+    ...shared,
+  }
+
+  // 2) Range → 206 / 416（仅在开启且前置条件通过时）
+  if (r.range && (method === 'GET' || method === 'HEAD') && req?.headers.range && rangePreconditionOk(req.headers, validators)) {
+    const range = parseRange(req.headers.range as string, st.size)
+    if (range === 'unsatisfied') {
+      res.writeHead(416, { ...entity, 'Content-Range': `bytes */${st.size}`, 'Accept-Ranges': 'bytes' })
+      res.end()
+      return
+    }
+    if (range) {
+      const len = range.end - range.start + 1
+      res.writeHead(206, {
+        ...entity,
+        'Content-Range': `bytes ${range.start}-${range.end}/${st.size}`,
+        'Content-Length': len,
+        'Accept-Ranges': 'bytes',
+      })
+      if (method === 'HEAD') {
+        res.end()
+        return
+      }
+      createReadStream(filePath, { start: range.start, end: range.end }).pipe(res)
+      return
+    }
+    // range === null（语法无效 / 多区间）→ 落到全量
+  }
+
+  // 3) 全量 200
+  const fullHeaders: Record<string, string | number> = { ...entity, 'Content-Length': st.size }
+  if (r.range) fullHeaders['Accept-Ranges'] = 'bytes'
+  res.writeHead(status, fullHeaders)
+  if (method === 'HEAD') {
+    res.end()
+    return
+  }
+  createReadStream(filePath).pipe(res)
+}
+
 /** 执行原始响应（文件流式 / HTML / Buffer / Text）；绕过统一 JSON 封装 */
 export function sendRawResponse(res: ServerResponse, r: Exclude<RawResponse, { kind: 'view' }>, d?: ResponseDefaults): void {
   const status = r.status ?? d?.status ?? 200
@@ -72,35 +156,7 @@ export function sendRawResponse(res: ServerResponse, r: Exclude<RawResponse, { k
   const extra = r.headers
 
   if (r.kind === 'file') {
-    const filePath = resolve(r.filePath)
-    let st
-    try {
-      st = statSync(filePath)
-    } catch {
-      st = undefined
-    }
-    if (!st || !st.isFile()) {
-      const text = JSON.stringify({ success: false, message: '文件不存在', data: null })
-      res.writeHead(404, withDefaults({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(text) }, d))
-      res.end(text)
-      return
-    }
-    const fname = r.filename ?? basename(filePath)
-    const headers = withDefaults(
-      {
-        'Content-Type': r.mimeType ?? guessContentType(filePath),
-        'Content-Length': st.size,
-        'Content-Disposition': contentDisposition(r.download === false ? 'inline' : 'attachment', fname),
-      },
-      d,
-      extra,
-    )
-    res.writeHead(status, headers)
-    if (res.req?.method === 'HEAD') {
-      res.end()
-      return
-    }
-    createReadStream(filePath).pipe(res)
+    serveFile(res, r, d)
     return
   }
 

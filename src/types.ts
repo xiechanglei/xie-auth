@@ -25,6 +25,14 @@ export interface FileResponse extends RawResponseBase {
   filename?: string
   /** MIME 类型，默认按扩展名推断 */
   mimeType?: string
+  /** ETag：true 自动生成 `"<mtimeMs>-<size>"`（不读内容）；字符串=自定义；缺省关闭 */
+  etag?: boolean | string
+  /** Last-Modified：true 取文件 mtime；Date=指定；缺省关闭 */
+  lastModified?: boolean | Date
+  /** Cache-Control 头原文（如 'public, max-age=3600, immutable'）；不传则不下发 */
+  cacheControl?: string
+  /** 是否支持 Range / 206 / 416（单区间）；缺省关闭 */
+  range?: boolean
 }
 
 /** HTML 页面响应 */
@@ -195,10 +203,24 @@ export interface Ctx {
   clearCookie(name: string, opts?: CookieSerializeOptions): void
 
   // ---- 原始响应构建 ----
-  /** 返回磁盘文件（默认作为附件下载）；绕过 JSON 封装，文件不存在自动 404 */
+  /** 返回磁盘文件（默认作为附件下载）；绕过 JSON 封装，文件不存在自动 404；可选条件缓存与 Range */
   sendFile(
     filePath: string,
-    opts?: { download?: boolean; filename?: string; mimeType?: string; status?: number; headers?: Record<string, string> },
+    opts?: {
+      download?: boolean
+      filename?: string
+      mimeType?: string
+      status?: number
+      headers?: Record<string, string>
+      /** 启用/自定义 ETag（默认关闭） */
+      etag?: boolean | string
+      /** 启用/指定 Last-Modified（默认关闭） */
+      lastModified?: boolean | Date
+      /** Cache-Control 头原文（不下发则省） */
+      cacheControl?: string
+      /** 启用 Range/206/416（默认关闭） */
+      range?: boolean
+    },
   ): FileResponse
   /** 返回一段 HTML 页面（text/html） */
   sendHtml(html: string, opts?: { status?: number; headers?: Record<string, string> }): HtmlResponse
