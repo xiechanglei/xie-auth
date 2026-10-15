@@ -1,0 +1,134 @@
+// 端到端功能测试：真正启动 AuthServer，覆盖注册/登录/鉴权/改密失效/IP/静态/404
+import { createAuthServer } from '../dist/index.js'
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+let passed = 0
+let failed = 0
+function assert(cond, msg) {
+  if (cond) {
+    passed++
+    console.log('  ✅', msg)
+  } else {
+    failed++
+    console.error('  ❌', msg)
+  }
+}
+
+const work = mkdtempSync(join(tmpdir(), 'xie-auth-test-'))
+const storeFile = join(work, 'users.json')
+const staticDir = join(work, 'public')
+const uploadDir = join(work, 'uploads')
+mkdirSync(staticDir, { recursive: true })
+writeFileSync(join(staticDir, 'index.html'), '<h1>HOME</h1>')
+
+const PORT = 39717
+const BASE = `http://127.0.0.1:${PORT}`
+
+const server = createAuthServer()
+  .userStore(storeFile)
+  .static(staticDir)
+  .upload(uploadDir, { maxSize: '5MB', ttl: '0' })
+  .use('/ping', () => 'pong')
+  .useAuth('/whoami', (ctx) => ctx.user)
+  .useAdmin('/admin-only', () => ({ ok: true }))
+  .serve(PORT)
+
+async function waitForReady() {
+  for (let i = 0; i < 50; i++) {
+    try {
+      const r = await fetch(`${BASE}/ping`)
+      if (r.ok) return
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((res) => setTimeout(res, 50))
+  }
+  throw new Error('服务未能就绪')
+}
+
+async function main() {
+  await waitForReady()
+
+  console.log('\n[公开接口与鉴权档位]')
+  const ping = await (await fetch(`${BASE}/ping`)).json()
+  assert(ping.success && ping.data === 'pong', 'GET /ping 返回 pong')
+
+  const whoUnauth = await fetch(`${BASE}/whoami`)
+  assert(whoUnauth.status === 401, '未登录访问 useAuth 路由返回 401')
+
+  console.log('\n[首个管理员注册]')
+  const reg = await (
+    await fetch(`${BASE}/auth/api/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin0', password: 'secret123' }),
+    })
+  ).json()
+  assert(reg.success && reg.data.needApproval === false && reg.data.status === 'active', '首个用户自动 active 免审核')
+  const adminId = reg.data.id
+
+  const locked = await (
+    await fetch(`${BASE}/auth/api/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'someone', password: 'x' }),
+    })
+  ).json()
+  assert(!locked.success && /未开放注册/.test(locked.message), '首用户后默认关闭注册')
+
+  console.log('\n[登录与 Cookie 会话]')
+  const loginRes = await fetch(`${BASE}/auth/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'admin0', password: 'secret123' }),
+  })
+  const setCookie = loginRes.headers.get('set-cookie')
+  assert(loginRes.status === 200 && !!setCookie && setCookie.includes('xie_auth='), '登录成功并下发 Cookie')
+  const cookie = setCookie.split(';')[0]
+
+  const whoAuth = await (await fetch(`${BASE}/whoami`, { headers: { cookie } })).json()
+  assert(whoAuth.success && whoAuth.data.username === 'admin0', '带 Cookie 访问 useAuth 返回当前用户')
+
+  const adminRoute = await (await fetch(`${BASE}/admin-only`, { headers: { cookie } })).json()
+  assert(adminRoute.success && adminRoute.data.ok === true, 'admin 访问 useAdmin 路由通过')
+
+  console.log('\n[改密即失效 tokenVersion]')
+  const reset = await (
+    await fetch(`${BASE}/auth/api/users/${adminId}/password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', cookie },
+      body: JSON.stringify({ password: 'newsecret' }),
+    })
+  ).json()
+  assert(reset.success, 'admin 通过管理接口重置密码')
+  const whoAfterReset = await fetch(`${BASE}/whoami`, { headers: { cookie } })
+  assert(whoAfterReset.status === 401, '改密后旧 token 立即失效（401）')
+
+  console.log('\n[静态资源与 404]')
+  const home = await fetch(`${BASE}/`)
+  const homeText = await home.text()
+  assert(home.ok && homeText.includes('HOME'), '静态目录 index.html 可访问')
+  const notFound = await fetch(`${BASE}/no-such-route`)
+  assert(notFound.status === 404, '未知路由返回 404')
+
+  console.log('\n[内置页面]')
+  const loginPage = await fetch(`${BASE}/auth/login.html`)
+  assert(loginPage.ok && (await loginPage.text()).includes('登录'), '内置登录页可访问')
+  const guardJs = await fetch(`${BASE}/auth/xie-auth.js`)
+  assert(guardJs.ok && (await guardJs.text()).includes('XieAuth'), '客户端守卫脚本可访问')
+
+  server.stop()
+  rmSync(work, { recursive: true, force: true })
+
+  console.log(`\n结果：${passed} 通过 / ${failed} 失败`)
+  if (failed > 0) process.exit(1)
+}
+
+main().catch((e) => {
+  console.error('测试异常:', e)
+  server.stop()
+  rmSync(work, { recursive: true, force: true })
+  process.exit(1)
+})

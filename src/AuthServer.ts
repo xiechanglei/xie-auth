@@ -1,0 +1,427 @@
+import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
+import { existsSync, statSync, createReadStream } from 'node:fs'
+import { join, resolve, normalize, extname, dirname } from 'node:path'
+import { homedir } from 'node:os'
+import type {
+  Access,
+  Ctx,
+  GuardRule,
+  Handler,
+  Route,
+  UserRole,
+  UserStatus,
+} from './types.js'
+import { Store, toPublicUser } from './store.js'
+import { hashPassword, verifyPassword } from './crypto.js'
+import { normalizeMethods, compilePath, findRoute, globToRegExp } from './router.js'
+import { readBody, parseQuery, parseBody } from './net/request.js'
+import { sendJson, sendHtml, sendRedirect, wrapResult } from './net/response.js'
+import { UploadManager } from './net/upload.js'
+import { getClientIp, isIpAllowed } from './ipFilter.js'
+import {
+  issueToken,
+  resolveUser,
+  setAuthCookie,
+  clearAuthCookie,
+  safeRedirect,
+} from './auth/session.js'
+import { loginPage, registerPage, managerPage } from './auth/pages.js'
+import { guardScript } from './auth/guardScript.js'
+import { parseSize, parseDuration } from './util.js'
+import type { ResolvedUploadConfig, UploadOptions } from './types.js'
+
+const DEFAULT_STORE = join(homedir(), '.xie-auth', 'users.json')
+const DEFAULT_PORT = 3333
+const DEFAULT_JSON_LIMIT = 1024 * 1024 // 1MB
+
+/**
+ * 入口文件所在目录：`node /path/to/app.js` → `/path/to`。
+ * 用于把默认静态目录定位到入口文件同级的 public。
+ * （取 process.argv[1]，而非 process.cwd()；REPL / -e 等场景回退到 cwd）
+ */
+function entryDir(): string {
+  const script = process.argv[1]
+  return script ? dirname(resolve(script)) : process.cwd()
+}
+
+const DEFAULT_STATIC = join(entryDir(), 'public')
+
+interface GuardCompiled extends GuardRule {
+  regex: RegExp
+}
+
+/** 内置 /auth 相关内容的默认路由，在 serve 时注入 */
+export class AuthServer {
+  private storePath = DEFAULT_STORE
+  private staticDir = DEFAULT_STATIC
+  private uploadOpts: { dir: string; opts?: UploadOptions } | null = null
+  private routes: Route[] = []
+  private guards: GuardCompiled[] = []
+
+  private server: Server | null = null
+  private store: Store | null = null
+  private uploadManager: UploadManager | null = null
+  private uploadConfig: ResolvedUploadConfig | null = null
+
+  // ---- 链式配置 ----
+  userStore(filePath: string): this {
+    this.storePath = filePath
+    return this
+  }
+
+  static(dirPath: string): this {
+    this.staticDir = dirPath
+    return this
+  }
+
+  /** 上传落盘目录配置（dirPath 无默认值，未配置则不启用文件上传） */
+  upload(dirPath: string, opts?: UploadOptions): this {
+    this.uploadOpts = { dir: dirPath, opts }
+    return this
+  }
+
+  use(path: string, method?: string | Handler, handler?: Handler): this {
+    return this.addRoute('public', path, method, handler)
+  }
+
+  useAuth(path: string, method?: string | Handler, handler?: Handler): this {
+    return this.addRoute('auth', path, method, handler)
+  }
+
+  useAdmin(path: string, method?: string | Handler, handler?: Handler): this {
+    return this.addRoute('admin', path, method, handler)
+  }
+
+  authGuard(pattern: string, opts?: { role?: UserRole }): this {
+    this.guards.push({ pattern, role: opts?.role, regex: globToRegExp(pattern) })
+    return this
+  }
+
+  private addRoute(access: Access, path: string, method?: string | Handler, handler?: Handler): this {
+    const m = typeof method === 'function' ? undefined : method
+    const h = (typeof method === 'function' ? method : handler) as Handler
+    if (!h) throw new Error(`路由 ${path} 缺少 handler`)
+    const { matcher, paramNames } = compilePath(path)
+    this.routes.push({ rawPath: path, methods: normalizeMethods(m), handler: h, access, matcher, paramNames })
+    return this
+  }
+
+  // ---- 生命周期 ----
+  serve(port = DEFAULT_PORT): this {
+    if (this.server) throw new Error('服务已在运行，请先 stop()')
+
+    this.store = new Store(this.storePath)
+    if (this.uploadOpts) {
+      this.uploadConfig = this.resolveUpload(this.uploadOpts)
+      this.uploadManager = new UploadManager(this.uploadConfig)
+      this.uploadManager.startSweeper()
+    } else {
+      this.uploadConfig = null
+      this.uploadManager = null
+    }
+    this.registerBuiltinRoutes()
+
+    const handler = (req: IncomingMessage, res: ServerResponse) => {
+      this.dispatch(req, res).catch((err: Error) => {
+        if (!res.headersSent) sendJson(res, 500, { success: false, message: err.message, data: null })
+        else res.end()
+      })
+    }
+    this.server = createServer(handler)
+    this.server.listen(port)
+
+    console.log('[xie-auth] 服务已启动')
+    console.log('  userStore :', resolve(this.storePath))
+    console.log('  static    :', resolve(this.staticDir))
+    console.log('  upload    :', this.uploadOpts ? resolve(this.uploadOpts.dir) : '(未配置)')
+    console.log('  port      :', port)
+    return this
+  }
+
+  stop(): void {
+    this.uploadManager?.stopSweeper()
+    if (this.server) {
+      this.server.close()
+      this.server = null
+    }
+  }
+
+  private resolveUpload(cfg: { dir: string; opts?: UploadOptions }): ResolvedUploadConfig {
+    const o = cfg.opts ?? {}
+    const dir = resolve(cfg.dir)
+    return {
+      dir,
+      keptDir: join(dir, 'kept'),
+      maxSizeBytes: o.maxSize !== undefined ? parseSize(o.maxSize) : parseSize('10MB'),
+      ttlMs: o.ttl !== undefined ? parseDuration(o.ttl) : parseDuration('24h'),
+      allowExtensions: o.allowExtensions ?? null,
+      maxFiles: o.maxFiles ?? 10,
+    }
+  }
+
+  // ---- 请求分发 ----
+  private async dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const store = this.store!
+    const url = req.url ?? '/'
+    const pathname = url.split('?')[0]
+    const method = (req.method ?? 'GET').toUpperCase()
+
+    // 1) IP 网关（含 /auth/ 自身）
+    const ip = getClientIp(req, store.settings.trustProxy)
+    if (!isIpAllowed(ip, store.settings)) {
+      sendJson(res, 403, { success: false, message: 'Forbidden', data: null })
+      return
+    }
+
+    // 2) /auth 页面与脚本（库自有）
+    if (this.handleAuthAssets(req, pathname, res, store)) return
+
+    // 3) 声明式守卫：命中且未登录/角色不符 → 跳登录
+    const user = resolveUser(store, req)
+    for (const g of this.guards) {
+      if (g.regex.test(pathname)) {
+        if (!user) {
+          sendRedirect(res, `/auth/login.html?redirect=${encodeURIComponent(pathname)}`)
+          return
+        }
+        if (g.role && user.role !== g.role) {
+          sendJson(res, 403, { success: false, message: 'Forbidden', data: null })
+          return
+        }
+        break
+      }
+    }
+
+    // 4) 业务 / 内置 API 路由
+    const found = findRoute(this.routes, pathname, method)
+    if (found) {
+      if (found.route.access !== 'public' && !user) {
+        sendJson(res, 401, { success: false, message: 'Unauthorized', data: null })
+        return
+      }
+      if (found.route.access === 'admin' && user?.role !== 'admin') {
+        sendJson(res, 403, { success: false, message: 'Forbidden', data: null })
+        return
+      }
+      await this.runHandler(found.route, found.params, req, res, method, url, user)
+      return
+    }
+
+    // 5) 静态资源（仅 GET/HEAD，不鉴权）
+    if (method === 'GET' || method === 'HEAD') {
+      if (this.serveStatic(pathname, res, method)) return
+    }
+
+    // 6) 404
+    sendJson(res, 404, { success: false, message: 'Not Found', data: null })
+  }
+
+  private async runHandler(
+    route: Route,
+    params: Record<string, string>,
+    req: IncomingMessage,
+    res: ServerResponse,
+    method: string,
+    url: string,
+    user: Ctx['user'],
+  ): Promise<void> {
+    const limit = this.uploadConfig ? this.uploadConfig.maxSizeBytes * this.uploadConfig.maxFiles : DEFAULT_JSON_LIMIT
+    const raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req, limit)
+    const { body, files } = parseBody(req, raw, this.uploadManager)
+    const ctx: Ctx = {
+      params,
+      query: parseQuery(url),
+      body,
+      files,
+      method,
+      path: route.rawPath,
+      user,
+      req,
+      res,
+    }
+    try {
+      const returned = await route.handler(ctx)
+      if (res.writableEnded) return
+      sendJson(res, 200, wrapResult(returned))
+    } catch (err) {
+      if (res.writableEnded) return
+      sendJson(res, 500, { success: false, message: (err as Error).message, data: null })
+    }
+  }
+
+  // ---- /auth 静态页面与脚本 ----
+  private handleAuthAssets(req: IncomingMessage, pathname: string, res: ServerResponse, store: Store): boolean {
+    if (pathname === '/auth/xie-auth.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' })
+      res.end(guardScript())
+      return true
+    }
+    if (pathname === '/auth/login.html') {
+      sendHtml(res, 200, loginPage())
+      return true
+    }
+    if (pathname === '/auth/register.html') {
+      sendHtml(res, 200, registerPage())
+      return true
+    }
+    if (pathname === '/auth/manager.html') {
+      // 管理页需登录且为 admin，否则跳登录
+      const u = resolveUser(store, req)
+      if (!u || u.role !== 'admin') {
+        sendRedirect(res, `/auth/login.html?redirect=${encodeURIComponent(pathname)}`)
+        return true
+      }
+      sendHtml(res, 200, managerPage())
+      return true
+    }
+    return false
+  }
+
+  // ---- 静态资源 ----
+  private serveStatic(pathname: string, res: ServerResponse, method: string): boolean {
+    const root = resolve(this.staticDir)
+    const safe = normalize(decodeURIComponent(pathname)).replace(/^([/\\])+/, '')
+    const filePath = join(root, safe)
+    if (!filePath.startsWith(root)) return false // 防目录穿越
+    if (!existsSync(filePath)) return false
+    let st
+    try {
+      st = statSync(filePath)
+    } catch {
+      return false
+    }
+    let target = filePath
+    if (st.isDirectory()) {
+      target = join(filePath, 'index.html')
+      if (!existsSync(target)) return false
+    }
+    res.writeHead(200, {
+      'Content-Type': contentType(target),
+      'Content-Length': statSync(target).size,
+    })
+    if (method === 'HEAD') {
+      res.end()
+      return true
+    }
+    createReadStream(target).pipe(res)
+    return true
+  }
+
+  // ---- 内置 /auth/api 路由 ----
+  private registerBuiltinRoutes(): void {
+    const store = this.store!
+    const builtin = (path: string, m: string, access: Access, h: Handler) => {
+      const { matcher, paramNames } = compilePath(path)
+      this.routes.unshift({ rawPath: path, methods: normalizeMethods(m), handler: h, access, matcher, paramNames })
+    }
+
+    // 注册（公开）
+    builtin('/auth/api/register', 'POST', 'public', (ctx) => {
+      const username = String(ctx.body.username ?? '').trim()
+      const password = String(ctx.body.password ?? '')
+      if (!username || !password) throw new Error('用户名和密码不能为空')
+      const canRegister = !store.hasUsers() || store.settings.openRegistration
+      if (!canRegister) throw new Error('当前未开放注册')
+      if (store.findByUsername(username)) throw new Error('用户名已存在')
+      const requireApproval = store.hasUsers() && store.settings.requireApproval
+      const status: UserStatus = requireApproval ? 'pending' : 'active'
+      const user = store.addUser({ username, passwordHash: hashPassword(password), status })
+      store.lockRegistrationIfFirstAdmin()
+      return { needApproval: requireApproval, id: user.id, status: user.status }
+    })
+
+    // 登录（公开）
+    builtin('/auth/api/login', 'POST', 'public', (ctx) => {
+      const username = String(ctx.body.username ?? '').trim()
+      const password = String(ctx.body.password ?? '')
+      const user = store.findByUsername(username)
+      if (!user || !verifyPassword(password, user.passwordHash)) throw new Error('用户名或密码错误')
+      if (user.status === 'pending') throw new Error('账号待管理员审核')
+      if (user.status === 'rejected') throw new Error('账号注册未被批准')
+      if (user.status === 'disabled') throw new Error('账号已被停用')
+      const token = issueToken(store, user.id)
+      setAuthCookie(ctx.res, token, store.settings.tokenTtl)
+      return { user: toPublicUser(user), redirect: safeRedirect(ctx.query.redirect) }
+    })
+
+    // 登出（公开）
+    builtin('/auth/api/logout', 'POST', 'public', (ctx) => {
+      clearAuthCookie(ctx.res)
+      return { loggedOut: true }
+    })
+
+    // 当前用户（需登录）
+    builtin('/auth/api/me', 'GET', 'auth', (ctx) => ctx.user)
+
+    // 用户列表（admin）
+    builtin('/auth/api/users', 'GET', 'admin', () => store.users.map(toPublicUser))
+
+    // 审核 / 停用 / 启用（admin）
+    builtin('/auth/api/users/:id/:action', 'POST', 'admin', (ctx) => {
+      const { id, action } = ctx.params
+      const map: Record<string, UserStatus> = { approve: 'active', reject: 'rejected', disable: 'disabled', enable: 'active' }
+      const next = map[action]
+      if (!next) throw new Error(`未知操作: ${action}`)
+      const updated = store.updateUser(id, { status: next })
+      if (!updated) throw new Error('用户不存在')
+      // 停用/拒绝 → 令牌失效
+      if (next !== 'active') store.bumpTokenVersion(id)
+      return toPublicUser(updated)
+    })
+
+    // 改角色（admin）
+    builtin('/auth/api/users/:id/role', 'POST', 'admin', (ctx) => {
+      const role = String(ctx.body.role) as UserRole
+      if (role !== 'admin' && role !== 'user') throw new Error('非法角色')
+      const updated = store.updateUser(ctx.params.id, { role })
+      if (!updated) throw new Error('用户不存在')
+      return toPublicUser(updated)
+    })
+
+    // 改密（admin）——改后 bump tokenVersion 使旧 token 失效
+    builtin('/auth/api/users/:id/password', 'POST', 'admin', (ctx) => {
+      const password = String(ctx.body.password ?? '')
+      if (!password) throw new Error('新密码不能为空')
+      const updated = store.updateUser(ctx.params.id, { passwordHash: hashPassword(password) })
+      if (!updated) throw new Error('用户不存在')
+      store.bumpTokenVersion(ctx.params.id)
+      return { reset: true }
+    })
+
+    // 读取设置（admin）
+    builtin('/auth/api/settings', 'GET', 'admin', () => store.settings)
+
+    // 更新设置（admin）
+    builtin('/auth/api/settings', 'POST', 'admin', (ctx) => {
+      const patch: Record<string, unknown> = {}
+      for (const key of ['openRegistration', 'requireApproval', 'trustProxy', 'ipMode', 'ipList'] as const) {
+        if (ctx.body[key] !== undefined) patch[key] = ctx.body[key]
+      }
+      // 防锁死：whitelist 模式必须至少保留操作者当前 IP
+      if (patch.ipMode === 'whitelist') {
+        const list = (patch.ipList as string[]) ?? []
+        const myIp = getClientIp(ctx.req, store.settings.trustProxy)
+        if (!list.some((e) => e === myIp)) list.push(myIp)
+        patch.ipList = list
+      }
+      return store.updateSettings(patch)
+    })
+  }
+}
+
+const MIME: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8',
+}
+
+function contentType(file: string): string {
+  return MIME[extname(file).toLowerCase()] ?? 'application/octet-stream'
+}
