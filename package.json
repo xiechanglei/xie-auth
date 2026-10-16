@@ -3,6 +3,7 @@
   "version": "1.4.1",
   "description": "嵌入式认证服务库：为第三方 Node.js 项目接管用户、注册、登录、鉴权与权限管理。链式 API 声明接口即可，文件存储、零外部运行时依赖。",
   "type": "module",
+  "access": "public",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
