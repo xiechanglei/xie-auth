@@ -12,6 +12,13 @@ function ensureDir(dir: string): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
 }
 
+/**
+ * 落盘写流与上游合并喂入的块大小（256KB）。
+ * 相比默认 64KB，更大的块让每 MB 的 feed/Buffer.concat 分配、indexOf 扫描、ws.write 与背压往返成倍减少，
+ * 代价是单个在途文件常驻内存约 256KB（与文件总大小无关，仍为恒定）。
+ */
+const STREAM_HWM = 256 * 1024
+
 /** 给错误附加 HTTP 状态码，供出口统一映射响应 */
 function withStatus<T extends Error>(err: T, statusCode: number): T {
   ;(err as T & { statusCode?: number }).statusCode = statusCode
@@ -39,7 +46,8 @@ function moveFile(from: string, to: string): void {
  */
 class FileSink {
   private readonly ws: WriteStream
-  private readonly hash: Hash
+  /** hashEnabled=false 时为 null（跳过增量 md5） */
+  private readonly hash: Hash | null
   /** 元信息留待 finish 时组装 */
   private readonly meta0: Omit<UploadedFileMeta, 'size' | 'md5' | 'uploadTime'>
   private received = 0
@@ -51,13 +59,13 @@ class FileSink {
   /** 异步写错误（提前捕获，避免无监听时抛未处理异常 / writev-after-destroyed） */
   private writeError: Error | null = null
 
-  constructor(info: { dir: string; storedName: string; field: string; filename: string; mimeType: string }, maxSize: number, tempPaths: string[]) {
+  constructor(info: { dir: string; storedName: string; field: string; filename: string; mimeType: string }, maxSize: number, hashEnabled: boolean, tempPaths: string[]) {
     this.maxSize = maxSize
     const filePath = join(info.dir, info.storedName)
     this.absPath = resolve(filePath)
     tempPaths.push(this.absPath) // 创建即登记，中途失败同样能被清理
-    this.ws = createWriteStream(filePath)
-    this.hash = createHash('md5')
+    this.ws = createWriteStream(filePath, { highWaterMark: STREAM_HWM })
+    this.hash = hashEnabled ? createHash('md5') : null
     this.meta0 = { ...info, path: this.absPath }
     // 提前挂 error：大文件写入中途的磁盘/句柄错误在此捕获，后续 onData 抛出以干净中止
     this.ws.on('error', (err: Error) => {
@@ -74,7 +82,7 @@ class FileSink {
       this.discard()
       throw withStatus(new Error(`文件 "${this.meta0.filename}" 超过大小上限`), 413)
     }
-    this.hash.update(chunk)
+    this.hash?.update(chunk)
     // 返回值 false 表示写流缓冲已满：置背压位，由上游暂停读取，杜绝无界内存排队与 writev-after-destroyed
     if (!this.ws.write(chunk)) this.backpressured = true
   }
@@ -126,7 +134,7 @@ class FileSink {
     const meta: UploadedFileMeta = {
       ...this.meta0,
       size: this.received,
-      md5: this.hash.digest('hex'),
+      md5: this.hash ? this.hash.digest('hex') : undefined,
       uploadTime: Date.now(),
     }
     return wrapFile(meta)
@@ -186,6 +194,7 @@ export class UploadManager {
     return new FileSink(
       { dir: this.config.dir, storedName, field: info.field, filename: cleanName, mimeType: info.contentType },
       this.config.maxSizeBytes,
+      this.config.hashEnabled,
       tempPaths,
     )
   }

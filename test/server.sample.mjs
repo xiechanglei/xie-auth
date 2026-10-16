@@ -4,9 +4,9 @@ import { createReadStream } from 'node:fs'
 import { join } from 'node:path'
 
 // 临时暂存目录（handler 结束后未转存的文件会被自动清理）
-const tempDir = 'd://upload'
+const tempDir = 'e://upload'
 // 正式保留目录（transferTo 的目标，演示"需保留则转存"）
-const keepDir = 'd://upload_kept'
+const keepDir = 'e://upload_kept'
 
 /**
  * 重新流式读取落盘文件算 md5，用于校验框架在接收时增量算出的 md5 是否正确。
@@ -27,7 +27,7 @@ const appServer = createAuthServer()
 appServer.title('upload demo')
 
 // 配置上传：临时暂存目录 + 单文件上限（放大到 2GB 以验证流式：大文件不会把整包读进内存）
-appServer.upload(tempDir, { maxSize: '5GB', maxFiles: 20 })
+appServer.upload(tempDir, { maxSize: '5GB', maxFiles: 20,hash:true })
 
 // ---- 单文件上传 ----
 appServer.use('/testOneFile', 'POST', async (ctx) => {

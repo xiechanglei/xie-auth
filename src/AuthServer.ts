@@ -178,6 +178,7 @@ export class AuthServer {
       maxSizeBytes: o.maxSize !== undefined ? parseSize(o.maxSize) : parseSize('10MB'),
       allowExtensions: o.allowExtensions ?? null,
       maxFiles: o.maxFiles ?? 10,
+      hashEnabled: o.hash ?? true,
     }
   }
 

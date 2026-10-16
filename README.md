@@ -123,13 +123,14 @@ ctx = {
   maxSize:         '10MB',  // 单文件大小上限（流式接收，超限即时中断）
   allowExtensions?: [],     // 扩展名白名单，如 ['png','jpg','pdf']
   maxFiles?:         10,    // 单请求最大文件数
+  hash?:            true,   // 是否增量计算 md5（默认 true；设 false 跳过 createHash 省 CPU）
 })
 ```
 
 - **`dirPath` 无默认值**（防止多个应用并行时落到同一目录冲突），配置了 `.upload` 才启用文件上传。
 - 解析结果进入 `ctx.files`，按字段名分组、同名归数组，采用**临时暂存 → `transferTo` 转存**模型（类 Spring `MultipartFile`，详见[文件上传生命周期](#文件上传生命周期)）。
-- 每个文件对象：`{ field, filename, storedName, mimeType, size, md5, uploadTime, path, transferTo(dest) }`。
-- **流式落盘**：请求体按 chunk 增量解析，文件段边到达边写入临时文件、`md5` 同步增量计算，**内存占用与文件大小无关**（数十 GB 上传也不会把整包读进内存）；普通表单字段仍攒内存（单值上限 1MB）。
+- 每个文件对象：`{ field, filename, storedName, mimeType, size, md5?, uploadTime, path, transferTo(dest) }`（`md5` 仅在 `hash` 开启时下发，默认开启）。
+- **流式落盘**：请求体按块增量解析，文件段边到达边写入临时文件、`md5` 同步增量计算，**内存占用与文件大小无关**（数十 GB 上传也不会把整包读进内存）；零碎的 socket chunk 会先攒到约 256KB 再喂解析器以摊薄每块固定开销，普通表单字段仍攒内存（单值上限 1MB）。
 
 ---
 

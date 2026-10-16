@@ -64,6 +64,12 @@ export interface Payload {
 const FIELD_VALUE_LIMIT = 1024 * 1024 // 1MB
 
 /**
+ * 上游读取合并目标：把零碎的 socket chunk 攒到约 256KB 再一次性喂解析器，
+ * 摊薄每块的 Buffer.concat 分配、indexOf 扫描、ws.write 与背压往返（与写流 HWM 对齐）。
+ */
+const COALESCE_TARGET = 256 * 1024
+
+/**
  * 依据 Content-Type 解析请求体。
  * - multipart/form-data：**流式**解析，文件段边到达边写临时文件（增量 md5），整包不驻留内存；
  * - 其余类型：按 limitBytes 缓冲读取后解析。
@@ -191,14 +197,21 @@ async function parseMultipartStream(
       req.pause()
       reject(err)
     }
-    req.on('data', (chunk: Buffer) => {
-      if (settled) return
+
+    // 合并零碎 chunk：攒到 ~COALESCE_TARGET 再一次性喂解析器，摊薄每块固定开销
+    const pending: Buffer[] = []
+    let pendingLen = 0
+    const flush = (): void => {
+      if (settled || pendingLen === 0) return
+      const merged = pending.length === 1 ? pending[0] : Buffer.concat(pending, pendingLen)
+      pending.length = 0
+      pendingLen = 0
       try {
-        parser.feed(chunk)
+        parser.feed(merged)
       } catch (err) {
         return fail(err as Error)
       }
-      // 背压：当前段为文件且写流缓冲已满 → 暂停读取，排空后恢复（在途数据始终≈一个 chunk）
+      // 背压：当前段为文件且写流缓冲已满 → 暂停读取，排空后恢复（在途数据始终≈一个合并块）
       const sinkRef = curSink
       if (sinkRef && !sinkRef.drained) {
         req.pause()
@@ -209,9 +222,18 @@ async function parseMultipartStream(
           req.resume()
         })
       }
+    }
+
+    req.on('data', (chunk: Buffer) => {
+      if (settled) return
+      pending.push(chunk)
+      pendingLen += chunk.length
+      if (pendingLen >= COALESCE_TARGET) flush()
     })
     req.on('end', () => {
       if (settled) return
+      flush() // 先把残余合并块喂完
+      if (settled) return // flush 内可能已 fail
       try {
         parser.finish()
       } catch (err) {

@@ -144,8 +144,11 @@ export interface UploadedFileMeta {
   storedName: string
   mimeType: string
   size: number
-  /** 内容 MD5（十六进制）；请求体流式落盘时按到达数据**增量计算**，与文件大小无关，不二次读盘 */
-  md5: string
+  /**
+   * 内容 MD5（十六进制）；请求体流式落盘时按到达数据**增量计算**，与文件大小无关，不二次读盘。
+   * 仅当上传配置 `hash` 开启（默认开启）时下发；显式关闭时该字段为 undefined。
+   */
+  md5?: string
   /** 上传（落临时区）时间，毫秒时间戳 */
   uploadTime: number
   /** 临时文件的绝对路径（handler 期间可读；未 transferTo 则请求结束后自动删除） */
@@ -274,6 +277,11 @@ export interface UploadOptions {
   maxSize?: string | number
   allowExtensions?: string[]
   maxFiles?: number
+  /**
+   * 是否在流式接收时增量计算每个文件的 MD5。**默认 true**。
+   * 设为 false 可跳过 createHash（大文件高速落盘、纯存储不需校验时可省 CPU），此时 file.md5 不下发。
+   */
+  hash?: boolean
 }
 
 /** 解析后的上传配置 */
@@ -282,4 +290,6 @@ export interface ResolvedUploadConfig {
   maxSizeBytes: number
   allowExtensions: string[] | null
   maxFiles: number
+  /** 是否增量计算 md5（对应 UploadOptions.hash，默认 true） */
+  hashEnabled: boolean
 }
