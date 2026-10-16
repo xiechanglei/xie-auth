@@ -3,15 +3,31 @@ import { parseMultipart, getBoundary } from './multipart.js'
 import { UploadManager } from './upload.js'
 import type { FilesField } from '../types.js'
 
+/** 请求体超限错误：携带 statusCode 供出口统一映射为 413 */
+export class BodyTooLargeError extends Error {
+  readonly statusCode = 413
+  constructor(message: string) {
+    super(message)
+    this.name = 'BodyTooLargeError'
+  }
+}
+
 /** 读取请求体为 Buffer，超过上限则 reject */
 export function readBody(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    // 预检 Content-Length：超限直接拒绝，不开始接收请求体（避免大 body 先占内存再报错）
+    const declared = Number(req.headers['content-length'])
+    if (Number.isFinite(declared) && declared > limitBytes) {
+      reject(new BodyTooLargeError('请求体超过大小上限'))
+      req.destroy()
+      return
+    }
     const chunks: Buffer[] = []
     let total = 0
     req.on('data', (chunk: Buffer) => {
       total += chunk.length
       if (total > limitBytes) {
-        reject(new Error('请求体超过大小上限'))
+        reject(new BodyTooLargeError('请求体超过大小上限'))
         req.destroy()
         return
       }
@@ -41,7 +57,7 @@ export interface Payload {
  * 依据 Content-Type 解析请求体；multipart 时文件交由 uploadManager 落盘。
  * 新创建的临时文件绝对路径会 push 进传入的 tempPaths（即使中途抛错也已收集，供调用方 finally 清理）。
  */
-export function parseBody(req: IncomingMessage, raw: Buffer, uploadManager: UploadManager | null, tempPaths: string[]): Payload {
+export async function parseBody(req: IncomingMessage, raw: Buffer, uploadManager: UploadManager | null, tempPaths: string[]): Promise<Payload> {
   const contentType = (req.headers['content-type'] ?? '').toString()
   const body: Record<string, unknown> = {}
   const files: FilesField = {}
@@ -78,7 +94,7 @@ export function parseBody(req: IncomingMessage, raw: Buffer, uploadManager: Uplo
       }
     }
     if (uploadManager) {
-      Object.assign(files, uploadManager.persist(parts, tempPaths))
+      Object.assign(files, await uploadManager.persist(parts, tempPaths))
     }
     return { body, files }
   }

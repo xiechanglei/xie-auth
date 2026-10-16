@@ -1,4 +1,5 @@
-import { mkdirSync, renameSync, unlinkSync, statSync, existsSync, readdirSync, writeFileSync, copyFileSync } from 'node:fs'
+import { mkdirSync, renameSync, unlinkSync, statSync, existsSync, readdirSync, copyFileSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { join, resolve, extname, dirname, sep } from 'node:path'
 import type { MultipartPart } from './multipart.js'
@@ -8,6 +9,12 @@ import { uuid } from '../crypto.js'
 
 function ensureDir(dir: string): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+}
+
+/** 给错误附加 HTTP 状态码，供出口统一映射响应 */
+function withStatus<T extends Error>(err: T, statusCode: number): T {
+  ;(err as T & { statusCode?: number }).statusCode = statusCode
+  return err
 }
 
 /** 移动文件，跨设备（EXDEV）回退为复制 + 删除 */
@@ -39,21 +46,27 @@ export class UploadManager {
     ensureDir(config.dir)
   }
 
-  /** 将 multipart 中的文件部分落盘；按字段分组返回，同时把创建的临时路径 push 进 tempPaths（供调用方兜底清理） */
-  persist(parts: MultipartPart[], tempPaths: string[]): FilesField {
+  /** 将 multipart 中的文件部分落盘；按字段分组返回，同时把创建的临时路径 push 进 tempPaths（供调用方兜底清理）。异步写盘，避免大文件同步 I/O 阻塞事件循环 */
+  async persist(parts: MultipartPart[], tempPaths: string[]): Promise<FilesField> {
     const files: FilesField = {}
     const dir = this.config.dir
     ensureDir(dir)
+
+    // 允许扩展名集合只算一次（而不是每个 part 重复 map）
+    const allowSet =
+      this.config.allowExtensions && this.config.allowExtensions.length > 0
+        ? new Set(this.config.allowExtensions.map((e) => e.toLowerCase().replace('.', '')))
+        : null
 
     let count = 0
     for (const part of parts) {
       if (part.filename === undefined) continue // 非文件字段跳过
       count++
       if (count > this.config.maxFiles) {
-        throw new Error(`上传文件数量超过上限（${this.config.maxFiles}）`)
+        throw withStatus(new Error(`上传文件数量超过上限（${this.config.maxFiles}）`), 413)
       }
       if (part.data.length > this.config.maxSizeBytes) {
-        throw new Error(`文件 "${sanitizeFilename(part.filename)}" 超过大小上限`)
+        throw withStatus(new Error(`文件 "${sanitizeFilename(part.filename)}" 超过大小上限`), 413)
       }
 
       const cleanName = sanitizeFilename(part.filename)
@@ -61,15 +74,15 @@ export class UploadManager {
       const storedName = `${uuid()}${ext}`
       const filePath = join(dir, storedName)
 
-      if (this.config.allowExtensions && this.config.allowExtensions.length > 0) {
+      if (allowSet) {
         const extNoDot = ext.replace('.', '').toLowerCase()
-        if (!this.config.allowExtensions.map((e) => e.toLowerCase().replace('.', '')).includes(extNoDot)) {
-          throw new Error(`不允许的文件类型: ${cleanName}`)
+        if (!allowSet.has(extNoDot)) {
+          throw withStatus(new Error(`不允许的文件类型: ${cleanName}`), 400)
         }
       }
 
-      // 写盘 + 基于内存缓冲算 md5：数据已在内存，无额外二次读盘
-      writeFileSync(filePath, part.data)
+      // 异步写盘（不阻塞事件循环）+ 基于内存缓冲算 md5：数据已在内存，无额外二次读盘
+      await writeFile(filePath, part.data)
       const absTemp = resolve(filePath)
       tempPaths.push(absTemp)
       const md5 = createHash('md5').update(part.data).digest('hex')

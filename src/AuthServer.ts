@@ -247,14 +247,20 @@ export class AuthServer {
     url: string,
     user: Ctx['user'],
   ): Promise<void> {
-    const limit = this.uploadConfig ? this.uploadConfig.maxSizeBytes * this.uploadConfig.maxFiles : DEFAULT_JSON_LIMIT
-    const raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req, limit)
+    // 按 Content-Type 区分请求体上限：仅 multipart 按上传总额放宽，
+    // 其余（JSON / form）固定用 json 上限，避免 maxSize 间接放大到所有路由
+    const contentType = (req.headers['content-type'] ?? '').toString()
+    const isMultipart = contentType.includes('multipart/form-data')
+    const limit = isMultipart && this.uploadConfig
+      ? this.uploadConfig.maxSizeBytes * this.uploadConfig.maxFiles
+      : DEFAULT_JSON_LIMIT
     // 本次请求落盘的临时文件（transferTo 会移走；未被转存的在 finally 中清理）
     const tempPaths: string[] = []
     // ctx 层累积的响应默认值：无论 return 数据还是 send*，出口统一应用
     const defaults: ResponseDefaults = { headers: {}, cookies: [], append: {} }
     try {
-      const { body, files } = parseBody(req, raw, this.uploadManager, tempPaths)
+      const raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req, limit)
+      const { body, files } = await parseBody(req, raw, this.uploadManager, tempPaths)
       const ctx: Ctx = {
         params,
         query: parseQuery(url),
@@ -320,7 +326,8 @@ export class AuthServer {
       sendJson(res, defaults.status ?? 200, wrapResult(returned), defaults)
     } catch (err) {
       if (res.writableEnded) return
-      sendJson(res, 500, { success: false, message: (err as Error).message, data: null }, defaults)
+      const status = (err as { statusCode?: number }).statusCode ?? 500
+      sendJson(res, status, { success: false, message: (err as Error).message, data: null }, defaults)
     } finally {
       // 无论成功 / 报错，都清掉本次未被 transferTo 转走的临时文件
       UploadManager.cleanupTemp(tempPaths)
