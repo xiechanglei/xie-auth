@@ -168,6 +168,7 @@ async function main() {
   assert(loginPage.ok && loginHtml.includes('登录'), '内置登录页可访问')
   assert(loginHtml.includes('MyApp 控制台'), '页面标题可通过 .title() 配置')
   assert(loginHtml.includes('id="toAdmin"'), '登录页提供“登录后进入管理后台”选项')
+  assert(loginHtml.includes("(toAdmin&&toAdmin.checked)?'/auth/manager.html':(params.get('redirect')"), 'toAdmin 勾选时优先跳管理后台（高于 ?redirect=）')
   const guardJs = await fetch(`${BASE}/auth/xie-auth.js`)
   assert(guardJs.ok && (await guardJs.text()).includes('XieAuth'), '客户端守卫脚本可访问')
 
@@ -324,6 +325,66 @@ async function main() {
   const dl0 = await fetch(`${BASE}/dl`)
   await dl0.text()
   assert(dl0.status === 200 && !dl0.headers.get('etag') && !dl0.headers.get('accept-ranges'), '默认 sendFile（未 opt-in）不带 ETag/Accept-Ranges')
+
+  console.log('\n[唯一启用管理员防锁死保护]')
+  // 当前 admin0 为唯一 admin+active（alice 已 disabled）
+  const selfDemote = await (
+    await fetch(`${BASE}/auth/api/users/${adminId}/role`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', cookie: adminCookie },
+      body: JSON.stringify({ role: 'user' }),
+    })
+  ).json()
+  assert(!selfDemote.success && /至少保留.*管理员.*无法降级/.test(selfDemote.message), '唯一启用 admin 自降级被拒')
+
+  const selfDisable = await (
+    await fetch(`${BASE}/auth/api/users/${adminId}/disable`, { method: 'POST', headers: { cookie: adminCookie } })
+  ).json()
+  assert(!selfDisable.success && /至少保留.*管理员.*无法停用/.test(selfDisable.message), '唯一启用 admin 自停用被拒')
+
+  // 提升另一个用户为 admin：先注册 active 的 bob（上面已关 openRegistration + 免审核）
+  const regBob = await (
+    await fetch(`${BASE}/auth/api/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'bob', password: 'pw123456' }),
+    })
+  ).json()
+  assert(regBob.success && regBob.data.status === 'active', 'bob 免审核注册直接 active')
+  const promoteBob = await (
+    await fetch(`${BASE}/auth/api/users/${regBob.data.id}/role`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', cookie: adminCookie },
+      body: JSON.stringify({ role: 'admin' }),
+    })
+  ).json()
+  assert(promoteBob.success && promoteBob.data.role === 'admin', '将 bob 提为 admin')
+
+  // 现在有两个 active admin，admin0 自降级应成功
+  const selfDemote2 = await (
+    await fetch(`${BASE}/auth/api/users/${adminId}/role`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', cookie: adminCookie },
+      body: JSON.stringify({ role: 'user' }),
+    })
+  ).json()
+  assert(selfDemote2.success && selfDemote2.data.role === 'user', '存在另一个 admin 后，admin0 可降级为 user')
+
+  // 此时 bob 成为唯一启用 admin，再对其降级 / 停用仍应被拒（用 bob 登录验证）
+  const bobLogin = await fetch(`${BASE}/auth/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'bob', password: 'pw123456' }),
+  })
+  const bobCookie = bobLogin.headers.get('set-cookie').split(';')[0]
+  const bobSelfDemote = await (
+    await fetch(`${BASE}/auth/api/users/${regBob.data.id}/role`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', cookie: bobCookie },
+      body: JSON.stringify({ role: 'user' }),
+    })
+  ).json()
+  assert(!bobSelfDemote.success && /至少保留/.test(bobSelfDemote.message), '降级后 bob 作为唯一 admin 也不能再自降级')
 
   server.stop()
   rmSync(work, { recursive: true, force: true })

@@ -114,7 +114,7 @@ function authPageScript(mode: 'login' | 'register'): string {
       ${mode === 'register' ? "if(j.data&&j.data.needApproval){msg('注册成功，等待管理员审核',true);setTimeout(function(){location.href='/auth/login.html'},1600);return}" : ''}
       ${
         mode === 'login'
-          ? "var toAdmin=document.getElementById('toAdmin');location.href=params.get('redirect')||((toAdmin&&toAdmin.checked)?'/auth/manager.html':'/');"
+          ? "var toAdmin=document.getElementById('toAdmin');location.href=(toAdmin&&toAdmin.checked)?'/auth/manager.html':(params.get('redirect')||'/');"
           : 'location.href=back();'
       }
     }).catch(function(e){btn.disabled=false;msg('请求出错:'+e.message)})

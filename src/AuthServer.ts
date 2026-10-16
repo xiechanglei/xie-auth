@@ -441,6 +441,19 @@ export class AuthServer {
     // 当前用户（需登录）
     builtin('/auth/api/me', 'GET', 'auth', (ctx) => ctx.user)
 
+    /**
+     * 防锁死不变量：系统必须至少保留一个 "admin + active" 用户。
+     * 命中下面任一路径都会导致无人能再进后台，因此需提前拒绝：
+     *  - 将最后一个启用中的 admin 降为 user
+     *  - 停用 / 拒绝最后一个启用中的 admin
+     * 合法回退流程：先把另一个用户提为 admin，再处理自己。
+     */
+    const isLastActiveAdmin = (userId: string): boolean => {
+      const t = store.findById(userId)
+      if (!t || t.role !== 'admin' || t.status !== 'active') return false
+      return !store.users.some((u) => u.id !== userId && u.role === 'admin' && u.status === 'active')
+    }
+
     // 用户列表（admin）
     builtin('/auth/api/users', 'GET', 'admin', () => store.users.map(toPublicUser))
 
@@ -450,6 +463,10 @@ export class AuthServer {
       const map: Record<string, UserStatus> = { approve: 'active', reject: 'rejected', disable: 'disabled', enable: 'active' }
       const next = map[action]
       if (!next) throw new Error(`未知操作: ${action}`)
+      // 停用 / 拒绝 会使目标脱离 active；若目标是最后一个启用 admin，拒绝
+      if (next !== 'active' && isLastActiveAdmin(id)) {
+        throw new Error('系统必须至少保留一个启用中的管理员，无法停用/拒绝')
+      }
       const updated = store.updateUser(id, { status: next })
       if (!updated) throw new Error('用户不存在')
       // 停用/拒绝 → 令牌失效
@@ -461,6 +478,10 @@ export class AuthServer {
     builtin('/auth/api/users/:id/role', 'POST', 'admin', (ctx) => {
       const role = String(ctx.body.role) as UserRole
       if (role !== 'admin' && role !== 'user') throw new Error('非法角色')
+      // 将最后一个启用 admin 降为 user 会锁死系统，拒绝
+      if (role === 'user' && isLastActiveAdmin(ctx.params.id)) {
+        throw new Error('系统必须至少保留一个启用中的管理员，无法降级')
+      }
       const updated = store.updateUser(ctx.params.id, { role })
       if (!updated) throw new Error('用户不存在')
       return toPublicUser(updated)

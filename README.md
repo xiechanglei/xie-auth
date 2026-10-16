@@ -278,7 +278,7 @@ const ua  = ctx.get('user-agent')                   // 读请求头
 库自动挂载以下内容（均在 `/auth/` 下），开发者无需实现：
 
 - **页面**：`/auth/login.html`、`/auth/register.html`、`/auth/manager.html`（管理员专用）
-  - 登录页提供“**登录后进入管理后台**”选项（无 `?redirect` 时勾选则跳 `/auth/manager.html`）。
+  - 登录页提供“**登录后进入管理后台**”选项（优先级：勾选→ `/auth/manager.html`；否则 `?redirect=` 回跳；再否则 `/`）。
   - 页面标题可通过 `.title(text)` 配置（默认 `xie-auth`）。
 - **接口**：注册、登录、登出、`GET /auth/api/me`（返回当前用户），以及管理接口（审核 / 停用 / 改密 / 设置注册开关 / IP 名单等，均 admin only）
 - **客户端守卫脚本**：`/auth/xie-auth.js`（见[登录跳转](#登录跳转客户端守卫--声明式守卫)）
@@ -327,6 +327,17 @@ HMAC 自签 token 无状态，签发后到期前天然有效。为支持"改密�
 - **改密码（本人或 admin 后台改）→ `tokenVersion++`** → 该用户此前所有 token 立即全部失效，须重新登录。
 - 同一机制顺带覆盖：停用 / 删除用户（状态非 `active` 直接拒绝）、角色变更后权限以实时存储为准。
 - **不维护会话表 / 黑名单**：文件存储下并发写会话表过重且易脏，版本号方案零额外结构。
+
+---
+
+## 最后启用管理员保护（防锁死）
+
+内置管理接口自动维护一条**不变量**：系统必须至少保留一个 `admin + active` 用户，避免“唯一管理员自降级 / 自停用 → 无 openRegistration 可回 → 后台完全锁死”的情况：
+
+- `POST /auth/api/users/:id/role` 将目标降为 `user`：若目标是“最后一个启用中的 admin” → 拒。`500` 并提示“至少保留一个启用中的管理员”。
+- `POST /auth/api/users/:id/disable`、`/reject`：同上拦截。
+- **不影响**：先将另一个用户 `role=admin`（且 `active`），再处理自己；这是官方推荐的交接流程。
+- 保护仅针对“当前会失去 admin 能力”的方向；promote / enable 不拦截。
 
 ---
 
