@@ -20,7 +20,7 @@ import { RAW_RESPONSE } from './types.js'
 import { Store, toPublicUser } from './store.js'
 import { hashPassword, verifyPassword } from './crypto.js'
 import { normalizeMethods, compilePath, findRoute, globToRegExp } from './router.js'
-import { readBody, parseQuery, parseBody } from './net/request.js'
+import { parseQuery, parseRequestBody } from './net/request.js'
 import { sendJson, sendHtml, sendRedirect, wrapResult, isRawResponse, sendRawResponse, guessContentType } from './net/response.js'
 import type { ResponseDefaults } from './net/response.js'
 import { parseCookies, serializeCookie } from './net/cookie.js'
@@ -247,20 +247,15 @@ export class AuthServer {
     url: string,
     user: Ctx['user'],
   ): Promise<void> {
-    // 按 Content-Type 区分请求体上限：仅 multipart 按上传总额放宽，
-    // 其余（JSON / form）固定用 json 上限，避免 maxSize 间接放大到所有路由
-    const contentType = (req.headers['content-type'] ?? '').toString()
-    const isMultipart = contentType.includes('multipart/form-data')
-    const limit = isMultipart && this.uploadConfig
-      ? this.uploadConfig.maxSizeBytes * this.uploadConfig.maxFiles
-      : DEFAULT_JSON_LIMIT
+    // 请求体上限：multipart 走流式解析（文件边到达边落盘，单文件受 maxSize 约束），
+    // limitBytes 仅对非 multipart（JSON / form）的缓冲读取生效，固定用 json 上限。
+    const limit = DEFAULT_JSON_LIMIT
     // 本次请求落盘的临时文件（transferTo 会移走；未被转存的在 finally 中清理）
     const tempPaths: string[] = []
     // ctx 层累积的响应默认值：无论 return 数据还是 send*，出口统一应用
     const defaults: ResponseDefaults = { headers: {}, cookies: [], append: {} }
     try {
-      const raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req, limit)
-      const { body, files } = await parseBody(req, raw, this.uploadManager, tempPaths)
+      const { body, files } = await parseRequestBody(req, limit, this.uploadManager, tempPaths)
       const ctx: Ctx = {
         params,
         query: parseQuery(url),
@@ -328,6 +323,10 @@ export class AuthServer {
       if (res.writableEnded) return
       const status = (err as { statusCode?: number }).statusCode ?? 500
       sendJson(res, status, { success: false, message: (err as Error).message, data: null }, defaults)
+      // 流式上传超限等场景中途中止时请求体未读完（已 pause）。用 destroy 发 RST 会冲掉客户端
+      // 尚未读取的 413 响应；改为响应 flush 完后 resume 优雅排空剩余请求体（解析器已 abort，
+      // data 事件被 settled 拦截仅丢弃、不驻留内存），让连接自然收尾。
+      if (!req.readableEnded) res.on('finish', () => req.resume())
     } finally {
       // 无论成功 / 报错，都清掉本次未被 transferTo 转走的临时文件
       UploadManager.cleanupTemp(tempPaths)

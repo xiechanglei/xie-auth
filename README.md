@@ -120,7 +120,7 @@ ctx = {
 
 ```
 .upload(dirPath, {
-  maxSize:         '10MB',  // 单文件 & 总大小上限
+  maxSize:         '10MB',  // 单文件大小上限（流式接收，超限即时中断）
   allowExtensions?: [],     // 扩展名白名单，如 ['png','jpg','pdf']
   maxFiles?:         10,    // 单请求最大文件数
 })
@@ -128,7 +128,8 @@ ctx = {
 
 - **`dirPath` 无默认值**（防止多个应用并行时落到同一目录冲突），配置了 `.upload` 才启用文件上传。
 - 解析结果进入 `ctx.files`，按字段名分组、同名归数组，采用**临时暂存 → `transferTo` 转存**模型（类 Spring `MultipartFile`，详见[文件上传生命周期](#文件上传生命周期)）。
-- 每个文件对象：`{ field, filename, storedName, mimeType, size, md5, uploadTime, path, transferTo(dest) }`；其中 `md5` 在写盘时基于内存缓冲**实时计算**，不额外二次读盘。
+- 每个文件对象：`{ field, filename, storedName, mimeType, size, md5, uploadTime, path, transferTo(dest) }`。
+- **流式落盘**：请求体按 chunk 增量解析，文件段边到达边写入临时文件、`md5` 同步增量计算，**内存占用与文件大小无关**（数十 GB 上传也不会把整包读进内存）；普通表单字段仍攒内存（单值上限 1MB）。
 
 ---
 
@@ -387,10 +388,10 @@ HMAC 自签 token 无状态，签发后到期前天然有效。为支持"改密�
 
 | 阶段 | 行为 |
 |------|------|
-| **落地即临时** | 上传文件写入临时区（`.upload(dir)` 目录），按 `<dir>/<uuid>.<ext>` 存盘；写盘时基于内存缓冲实时算出 `md5` |
+| **流式落地即临时** | 请求体按 chunk 流式解析，上传文件边到达边写入临时区（`.upload(dir)` 目录），按 `<dir>/<uuid>.<ext>` 存盘；`md5` 同步增量算出，内存占用与文件大小无关 |
 | **handler 拿文件对象** | `ctx.files.<field>[0]` 提供 `{ filename, size, md5, uploadTime, path, transferTo(dest) }`，`path` 在本请求 handler 期间可读 |
 | **需要保留则转存** | 调用 `file.transferTo(dest)` 将临时文件**移动**到正式位置（重命名，跨设备回退复制）；`dest` 为目录则以原始文件名落入，为路径则按确切路径存放（自动建父目录），返回最终绝对路径 |
-| **请求结束自动清理** | handler 结束（成功或抛错）后，**未被 `transferTo` 转走**的临时文件一律删除 |
+| **请求结束自动清理** | handler 结束（成功或抛错）后，**未被 `transferTo` 转走**的临时文件一律删除（含超限/中断产生的半成品） |
 | **启动清孤儿** | 每次服务启动 `purgeStale()` 清空临时区，回收上次进程崩溃 / 重启遗留的孤儿文件 |
 
 ```js
@@ -438,7 +439,7 @@ xie-auth/
 │   ├── index.ts            # 入口：导出 createAuthServer / AuthServer / 类型
 │   ├── AuthServer.ts       # 链式 Builder + 请求分发流水线 + 内置路由
 │   ├── types.ts / crypto.ts / store.ts / router.ts / util.ts / ipFilter.ts
-│   ├── net/                # multipart / request / response / upload / cookie / template / fileStream
+│   ├── net/                # multipart / multipartStream / request / response / upload / cookie / template / fileStream
 │   └── auth/               # session / pages / guardScript
 ├── test/                   # 针对构建产物（dist/）的端到端功能测试
 │   └── server.test.mjs

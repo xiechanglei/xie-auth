@@ -144,7 +144,7 @@ export interface UploadedFileMeta {
   storedName: string
   mimeType: string
   size: number
-  /** 内容 MD5（十六进制）；写入临时文件时基于内存缓冲实时算出，不重复读盘 */
+  /** 内容 MD5（十六进制）；请求体流式落盘时按到达数据**增量计算**，与文件大小无关，不二次读盘 */
   md5: string
   /** 上传（落临时区）时间，毫秒时间戳 */
   uploadTime: number

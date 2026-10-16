@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>上传测试</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 24px; background: #f5f6f8; color: #222; }
+      h1 { font-size: 20px; margin: 0 0 20px; }
+      .card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.08); max-width: 760px; }
+      .card h2 { font-size: 16px; margin: 0 0 14px; }
+      input[type=file] { margin-bottom: 12px; display: block; }
+      button { background: #2f6fed; color: #fff; border: 0; border-radius: 6px; padding: 8px 18px; font-size: 14px; cursor: pointer; }
+      button:disabled { background: #9bb4e8; cursor: not-allowed; }
+      .bar-wrap { background: #eceff3; border-radius: 6px; height: 14px; margin: 14px 0 6px; overflow: hidden; }
+      .bar { background: linear-gradient(90deg,#3d82ff,#2f6fed); height: 100%; width: 0; transition: width .1s; }
+      .stat { font-size: 13px; color: #555; }
+      .result { margin-top: 14px; font-size: 13px; }
+      .result table { border-collapse: collapse; width: 100%; }
+      .result th, .result td { border: 1px solid #e3e6ea; padding: 6px 8px; text-align: left; word-break: break-all; }
+      .result th { background: #f7f9fc; }
+      .ok { color: #17a34a; font-weight: 600; }
+      .bad { color: #d33; font-weight: 600; }
+      pre { background: #f7f9fc; padding: 10px; border-radius: 6px; overflow: auto; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>文件上传测试（流式落盘 + md5 校验）</h1>
+
+    <!-- 单文件 -->
+    <div class="card">
+      <h2>① 单文件上传 → /testOneFile</h2>
+      <input type="file" id="oneFile" />
+      <button id="oneBtn" onclick="uploadOne()">上传</button>
+      <div class="bar-wrap"><div class="bar" id="oneBar"></div></div>
+      <div class="stat" id="oneStat">待选择文件</div>
+      <div class="result" id="oneResult"></div>
+    </div>
+
+    <!-- 多文件 -->
+    <div class="card">
+      <h2>② 多文件上传 → /testMutiFile</h2>
+      <input type="file" id="multiFiles" multiple />
+      <button id="multiBtn" onclick="uploadMulti()">上传全部</button>
+      <div class="bar-wrap"><div class="bar" id="multiBar"></div></div>
+      <div class="stat" id="multiStat">待选择文件</div>
+      <div class="result" id="multiResult"></div>
+    </div>
+
+    <script>
+      function fmt(n) {
+        if (n < 1024) return n + ' B'
+        if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
+        if (n < 1024 * 1024 * 1024) return (n / 1048576).toFixed(1) + ' MB'
+        return (n / 1073741824).toFixed(2) + ' GB'
+      }
+
+      // 通用上传：走 XMLHttpRequest 才能拿到 upload.onprogress
+      function doUpload(url, formData, ui) {
+        const btn = document.getElementById(ui.btn)
+        const bar = document.getElementById(ui.bar)
+        const stat = document.getElementById(ui.stat)
+        const result = document.getElementById(ui.result)
+        btn.disabled = true
+        bar.style.width = '0'
+        stat.textContent = '上传中…'
+        result.innerHTML = ''
+
+        const xhr = new XMLHttpRequest()
+        const t0 = Date.now()
+        xhr.upload.onprogress = (e) => {
+          if (!e.lengthComputable) return
+          const pct = (e.loaded / e.total) * 100
+          bar.style.width = pct.toFixed(1) + '%'
+          const sec = (Date.now() - t0) / 1000
+          const speed = sec > 0 ? e.loaded / sec : 0
+          stat.textContent =
+            `已传 ${fmt(e.loaded)} / ${fmt(e.total)}（${pct.toFixed(1)}%） 用时 ${sec.toFixed(1)}s  均速 ${fmt(speed)}/s`
+        }
+        xhr.onload = () => {
+          btn.disabled = false
+          let json
+          try { json = JSON.parse(xhr.responseText) } catch { json = { success: false, message: '响应非 JSON：' + xhr.responseText } }
+          if (!json.success) {
+            stat.textContent = '失败：' + json.message
+            result.innerHTML = `<pre>${JSON.stringify(json, null, 2)}</pre>`
+            return
+          }
+          stat.textContent = '完成 ✅（服务端已复核 md5）'
+          renderResult(ui.name, json.data, result)
+        }
+        xhr.onerror = () => {
+          btn.disabled = false
+          stat.textContent = '网络错误'
+        }
+        xhr.open('POST', url)
+        xhr.send(formData)
+      }
+
+      function renderResult(kind, data, el) {
+        if (kind === 'one') {
+          el.innerHTML = `<table>
+            <tr><th>字段</th><td>${data.field}</td></tr>
+            <tr><th>文件名</th><td>${data.filename}</td></tr>
+            <tr><th>大小</th><td>${fmt(data.size)}</td></tr>
+            <tr><th>流式 md5</th><td>${data.md5}</td></tr>
+            <tr><th>复核 md5</th><td>${data.realMd5}</td></tr>
+            <tr><th>md5 一致</th><td class="${data.md5Match ? 'ok' : 'bad'}">${data.md5Match ? '是 ✓' : '否 ✗'}</td></tr>
+            <tr><th>转存路径</th><td>${data.saved}</td></tr>
+          </table>`
+        } else {
+          const rows = data.files.map((f) => `<tr>
+            <td>${f.field}</td><td>${f.filename}</td><td>${fmt(f.size)}</td>
+            <td>${f.md5}</td><td>${f.realMd5}</td>
+            <td class="${f.md5Match ? 'ok' : 'bad'}">${f.md5Match ? '✓' : '✗'}</td>
+          </tr>`).join('')
+          el.innerHTML = `<p>共 ${data.count} 个文件，全部 md5 一致：
+            <span class="${data.allMatch ? 'ok' : 'bad'}">${data.allMatch ? '是 ✓' : '否 ✗'}</span></p>
+            <table><tr><th>字段</th><th>文件名</th><th>大小</th><th>流式 md5</th><th>复核 md5</th><th>一致</th></tr>
+            ${rows}</table>`
+        }
+      }
+
+      function uploadOne() {
+        const input = document.getElementById('oneFile')
+        if (!input.files.length) { alert('请先选择文件'); return }
+        const fd = new FormData()
+        fd.append('file', input.files[0]) // 字段名 file，对应服务端 ctx.files.file
+        doUpload('/testOneFile', fd, { btn: 'oneBtn', bar: 'oneBar', stat: 'oneStat', result: 'oneResult', name: 'one' })
+      }
+
+      function uploadMulti() {
+        const input = document.getElementById('multiFiles')
+        if (!input.files.length) { alert('请先选择文件'); return }
+        const fd = new FormData()
+        for (const f of input.files) fd.append('files', f) // 同名字段 files，服务端归为数组
+        doUpload('/testMutiFile', fd, { btn: 'multiBtn', bar: 'multiBar', stat: 'multiStat', result: 'multiResult', name: 'multi' })
+      }
+    </script>
+  </body>
+</html>
