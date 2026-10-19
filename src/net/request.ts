@@ -211,7 +211,7 @@ async function parseMultipartStream(
       } catch (err) {
         return fail(err as Error)
       }
-      // 背压：当前段为文件且写流缓冲已满 → 暂停读取，排空后恢复（在途数据始终≈一个合并块）
+      // 背压：当前段为文件且写流积压超水位 → 暂停读取，排空后恢复（在途数据上界≈水位线+一个合并块，恒定）
       const sinkRef = curSink
       if (sinkRef && !sinkRef.drained) {
         req.pause()

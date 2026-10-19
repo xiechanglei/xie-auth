@@ -14,10 +14,16 @@ function ensureDir(dir: string): void {
 
 /**
  * 落盘写流与上游合并喂入的块大小（256KB）。
- * 相比默认 64KB，更大的块让每 MB 的 feed/Buffer.concat 分配、indexOf 扫描、ws.write 与背压往返成倍减少，
- * 代价是单个在途文件常驻内存约 256KB（与文件总大小无关，仍为恒定）。
+ * 相比默认 64KB，更大的块让每 MB 的 feed/Buffer.concat 分配、indexOf 扫描、ws.write 与背压往返成倍减少。
  */
 const STREAM_HWM = 256 * 1024
+
+/**
+ * 背压水位线（4MB）：写流排队积压达到该值才暂停上游读取。
+ * 与 HWM 解耦形成流水线——水位内允许多块在途排队，磁盘 writev 之间不空窗；
+ * 在途内存上界恒定为「水位线 + 一个合并块」（≈4MB），与文件总大小无关。
+ */
+const PIPELINE_HIGH = 4 * 1024 * 1024
 
 /** 给错误附加 HTTP 状态码，供出口统一映射响应 */
 function withStatus<T extends Error>(err: T, statusCode: number): T {
@@ -83,8 +89,10 @@ class FileSink {
       throw withStatus(new Error(`文件 "${this.meta0.filename}" 超过大小上限`), 413)
     }
     this.hash?.update(chunk)
-    // 返回值 false 表示写流缓冲已满：置背压位，由上游暂停读取，杜绝无界内存排队与 writev-after-destroyed
-    if (!this.ws.write(chunk)) this.backpressured = true
+    this.ws.write(chunk)
+    // 流水线背压：仅当写流排队积压超过水位线才暂停上游（见 PIPELINE_HIGH），
+    // 水位内多块在途排队让磁盘持续写，杜绝「每块都等 drain」的串行空窗
+    if (this.ws.writableLength >= PIPELINE_HIGH) this.backpressured = true
   }
 
   /** 是否可继续接收下一个 chunk（无背压且流未损坏） */
