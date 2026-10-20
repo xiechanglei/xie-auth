@@ -153,14 +153,6 @@ export class AuthServer {
     }
     this.server = createServer(handler)
     this.server.listen(port)
-
-    console.log('[xie-auth] 服务已启动')
-    console.log('  title     :', this.pageTitle)
-    console.log('  userStore :', resolve(this.storePath))
-    console.log('  static    :', resolve(this.staticDir))
-    console.log('  views     :', this.viewsDir ? resolve(this.viewsDir) : '(未配置，sendView 复用 static)')
-    console.log('  upload    :', this.uploadOpts ? resolve(this.uploadOpts.dir) : '(未配置)')
-    console.log('  port      :', port)
     return this
   }
 
