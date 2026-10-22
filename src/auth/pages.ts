@@ -43,6 +43,11 @@ tbody tr:hover{background:#f8fafc}tbody tr:last-child td{border-bottom:none}
 .role-admin{background:#ede9fe;color:#6d28d9}.role-user{background:#e0f2fe;color:#0369a1}
 .st-active{background:#dcfce7;color:#166534}.st-pending{background:#fef3c7;color:#92400e}.st-rejected{background:#fee2e2;color:#b91c1c}.st-disabled{background:#e2e8f0;color:#475569}
 @media(max-width:760px){.container{grid-template-columns:1fr}}
+.tabs{display:flex;gap:0;border-bottom:2px solid var(--line);max-width:1040px;margin:1.25rem auto .75rem;padding:0 1.25rem}
+.tab-btn{padding:.6rem 1.25rem;font:inherit;font-weight:600;font-size:.9rem;border:none;background:none;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s}
+.tab-btn:hover{color:var(--ink)}
+.tab-btn.active{color:var(--brand);border-bottom-color:var(--brand)}
+.tab-panel{display:none}.tab-panel.active{display:block}
 </style>`
 
 function doc(title: string, bodyClass: string, inner: string): string {
@@ -132,28 +137,31 @@ export function managerPage(title = 'xie-auth'): string {
       ${brandMark(title, ' 管理台')}
       <div><span class="who">当前：<b id="who">—</b></span><button class="btn btn-ghost btn-xs" onclick="fetch('/auth/api/logout',{method:'POST'}).then(function(){location.href='/auth/login.html'})">登出</button></div>
     </div></div>
-    <div class="container">
-      <div class="card">
-        <h2>注册设置</h2>
-        <div class="row">
-          <label class="switch"><input type="checkbox" id="openRegistration"> 开放注册</label>
-          <label class="switch"><input type="checkbox" id="requireApproval"> 需要审核</label>
-        </div>
-        <button id="saveSettings" class="btn btn-xs">保存设置</button>
-      </div>
-      <div class="card">
-        <h2>IP 访问控制</h2>
-        <label for="ipMode">模式</label>
-        <select id="ipMode"><option value="off">关闭</option><option value="blacklist">黑名单</option><option value="whitelist">白名单</option></select>
-        <label for="ipList">名单（每行一个 IP / CIDR）</label>
-        <textarea id="ipList" rows="3" placeholder="203.0.113.7&#10;192.168.1.0/24"></textarea>
-        <div class="row"><label class="switch"><input type="checkbox" id="trustProxy"> 信任代理头 (X-Forwarded-For)</label></div>
-        <button id="saveIp" class="btn btn-xs">保存 IP 设置</button>
-      </div>
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="users">用户管理</button>
+      <button class="tab-btn" data-tab="settings">设置</button>
+    </div>
+    <div class="container tab-panel active" id="tab-users">
       <div class="card full">
         <h2>用户列表</h2>
         <div id="msg" class="msg"></div>
         <table><thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody id="users"></tbody></table>
+      </div>
+    </div>
+    <div class="container tab-panel" id="tab-settings">
+      <div class="card full">
+        <h2>系统设置</h2>
+        <div id="msgSettings" class="msg"></div>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="openRegistration"> 开放注册</label>
+          <label class="switch"><input type="checkbox" id="requireApproval"> 需要审核</label>
+        </div>
+        <label for="ipMode">IP 访问控制 · 模式</label>
+        <select id="ipMode"><option value="off">关闭</option><option value="blacklist">黑名单</option><option value="whitelist">白名单</option></select>
+        <label for="ipList">名单（每行一个 IP / CIDR）</label>
+        <textarea id="ipList" rows="3" placeholder="203.0.113.7&#10;192.168.1.0/24"></textarea>
+        <div class="row"><label class="switch"><input type="checkbox" id="trustProxy"> 信任代理头 (X-Forwarded-For)</label></div>
+        <button id="saveSettings" class="btn btn-xs">保存设置</button>
       </div>
     </div>
     <script>${managerScript()}</script>`,
@@ -162,10 +170,10 @@ export function managerPage(title = 'xie-auth'): string {
 
 function managerScript(): string {
   return `(function(){
-  function msg(t,ok){var e=document.getElementById('msg');e.className='msg '+(ok?'ok':'err');e.textContent=t;setTimeout(function(){e.textContent='';e.className='msg'},3000)}
+  function msg(t,ok,id){var e=document.getElementById(id||'msg');e.className='msg '+(ok?'ok':'err');e.textContent=t;setTimeout(function(){e.textContent='';e.className='msg'},3000)}
   function api(path,opts){return fetch(path,opts).then(function(r){return r.json()}).then(function(j){if(!j.success)throw new Error(j.message);return j.data})}
   function json(body){return {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}}
-  function loadMe(){api('/auth/api/me').then(function(u){document.getElementById('who').textContent=u.username+' · '+u.role;if(u.role!=='admin'){document.querySelector('.container').innerHTML='<div class="card full">需要管理员权限</div>'}})}
+  function loadMe(){api('/auth/api/me').then(function(u){document.getElementById('who').textContent=u.username+' · '+u.role;if(u.role!=='admin'){document.querySelector('.tabs').style.display='none';document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active')});document.getElementById('tab-users').innerHTML='<div class="card full">需要管理员权限</div>';document.getElementById('tab-users').classList.add('active')}})}
   function loadSettings(){api('/auth/api/settings').then(function(s){
     document.getElementById('openRegistration').checked=s.openRegistration;
     document.getElementById('requireApproval').checked=s.requireApproval;
@@ -191,8 +199,16 @@ function managerScript(): string {
   window.act=function(id,a){api('/auth/api/users/'+id+'/'+a,{method:'POST'}).then(function(){msg('已更新',true);loadUsers()}).catch(function(e){msg(e.message)})}
   window.setRole=function(id,role){api('/auth/api/users/'+id+'/role',json({role})).then(function(){msg('角色已更新',true);loadUsers()}).catch(function(e){msg(e.message)})}
   window.resetPw=function(id){var p=prompt('新密码（该用户所有登录令牌将失效）');if(p==null)return;if(!p){msg('密码不能为空');return}api('/auth/api/users/'+id+'/password',json({password:p})).then(function(){msg('密码已重置',true)}).catch(function(e){msg(e.message)})}
-  document.getElementById('saveSettings').onclick=function(){api('/auth/api/settings',json({openRegistration:document.getElementById('openRegistration').checked,requireApproval:document.getElementById('requireApproval').checked})).then(function(){msg('设置已保存',true)}).catch(function(e){msg(e.message)})}
-  document.getElementById('saveIp').onclick=function(){var list=document.getElementById('ipList').value.split('\\n').map(function(s){return s.trim()}).filter(Boolean);api('/auth/api/settings',json({ipMode:document.getElementById('ipMode').value,ipList:list,trustProxy:document.getElementById('trustProxy').checked})).then(function(){msg('IP 设置已保存',true)}).catch(function(e){msg(e.message)})}
-  loadMe();loadSettings();loadUsers();
+  document.getElementById('saveSettings').onclick=function(){var list=document.getElementById('ipList').value.split('\\n').map(function(s){return s.trim()}).filter(Boolean);api('/auth/api/settings',json({openRegistration:document.getElementById('openRegistration').checked,requireApproval:document.getElementById('requireApproval').checked,ipMode:document.getElementById('ipMode').value,ipList:list,trustProxy:document.getElementById('trustProxy').checked})).then(function(){msg('设置已保存',true,'msgSettings')}).catch(function(e){msg(e.message,false,'msgSettings')})}
+  function initTabs(){
+    var btns=document.querySelectorAll('.tab-btn');
+    btns.forEach(function(btn){btn.onclick=function(){
+      btns.forEach(function(b){b.classList.remove('active')});
+      document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active')});
+      btn.classList.add('active');
+      document.getElementById('tab-'+btn.dataset.tab).classList.add('active');
+    }});
+  }
+  initTabs();loadMe();loadSettings();loadUsers();
 })()`
 }
