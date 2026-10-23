@@ -50,12 +50,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xie-work/xie-auth.git"
+    "url": "git+https://github.com/xiechanglei/xie-auth.git"
   },
   "bugs": {
-    "url": "https://github.com/xie-work/xie-auth/issues"
+    "url": "https://github.com/xiechanglei/xie-auth/issues"
   },
-  "homepage": "https://github.com/xie-work/xie-auth#readme",
+  "homepage": "https://github.com/xiechanglei/xie-auth#readme",
   "publishConfig": {
     "access": "public"
   },
